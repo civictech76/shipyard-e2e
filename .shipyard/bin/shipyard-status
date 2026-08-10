@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""shipyard-status — what is where, derived live from git + the board.
+
+Renders the board by status, each epic with its branch / preview / sub-task
+progress, plus receipt freshness per epic branch and anything waiting in the
+inbox. Read-only; never cached — everything here is re-derived on each run.
+
+  shipyard-status [--json]
+
+Exit: 0 · 3 no .shipyard
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+BOARD = load(os.path.join(HERE, "shipyard-board"), "shipyard_board")
+
+
+def sh(args, cwd=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def main(argv):
+    d = os.getcwd()
+    while not os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+        p = os.path.dirname(d)
+        if p == d:
+            print("shipyard-status: no .shipyard/config.yml — run `/shipyard init`", file=sys.stderr)
+            sys.exit(3)
+        d = p
+    root = d
+
+    board = BOARD.Board(root)
+    epics = []
+    for m, i, sec in board.epics():
+        if not m:
+            continue
+        a, b = board.epic_block(i)
+        tasks = [BOARD.TASK_RE.match(l) for l in board.lines[a:b] if re.match(r"^- \[", l)]
+        tasks = [t for t in tasks if t]
+        done = sum(1 for t in tasks if t.group("done") == "x")
+        branch = m.group("branch")
+        exists = sh(["git", "rev-parse", "--verify", branch], cwd=root).returncode == 0
+        slug = branch.replace("/", "-")
+        rpath = os.path.join(root, ".shipyard", "receipts", f"{slug}.json")
+        receipt = None
+        if os.path.isfile(rpath):
+            r = sh([sys.executable, os.path.join(HERE, "shipyard-verify"), "check", "--ref",
+                    sh(["git", "rev-parse", branch], cwd=root).stdout.strip()], cwd=root)
+            receipt = "valid" if r.returncode == 0 else "stale/invalid"
+        epics.append({
+            "id": f"E{m.group('num')}", "title": m.group("title"), "status": sec,
+            "branch": branch, "branch_exists": exists, "preview": m.group("preview"),
+            "paused": m.group("paused"), "depends": m.group("depends"),  # "E1, E3"
+            "tasks_done": done, "tasks_total": len(tasks), "receipt": receipt,
+        })
+
+    inbox_open = 0
+    ip = os.path.join(root, ".shipyard", "inbox.md")
+    if os.path.isfile(ip):
+        with open(ip, encoding="utf-8") as f:
+            inbox_open = len(re.findall(r"^- \[ \] ", f.read(), re.M))
+    changes_open = 0
+    cp = os.path.join(root, ".shipyard", "changes.md")
+    if os.path.isfile(cp):
+        with open(cp, encoding="utf-8") as f:
+            changes_open = len(re.findall(r"^## C\d+", f.read(), re.M))
+
+    if "--json" in argv:
+        print(json.dumps({"epics": epics, "inbox_open": inbox_open, "changes": changes_open}, indent=2))
+        return
+
+    branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root).stdout.strip()
+    print(f"\n  {os.path.basename(root)} · on {branch}\n")
+    if not epics:
+        print("  Board is empty — start with `/idea \"…\"` or `/prd <file>`.\n")
+    for status in board.statuses:
+        here = [e for e in epics if e["status"] == status]
+        if not here:
+            continue
+        print(f"  {status}")
+        for e in here:
+            bar = f"{e['tasks_done']}/{e['tasks_total']}" if e["tasks_total"] else "—"
+            bits = [f"{e['id']} {e['title']}", f"[{bar}]", e["branch"]]
+            if not e["branch_exists"]:
+                bits.append("(branch not created)")
+            if e["preview"] not in ("-", ""):
+                bits.append(e["preview"])
+            if e["receipt"]:
+                bits.append(f"receipt: {e['receipt']}")
+            if e["depends"]:
+                bits.append(f"depends {e['depends']}")
+            if e["paused"]:
+                bits.append(f"PAUSED: {e['paused']}")
+            print("    · " + "  ".join(bits))
+        print()
+    if inbox_open or changes_open:
+        print(f"  Waiting on you: {inbox_open} inbox question(s), {changes_open} change ticket(s)\n")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

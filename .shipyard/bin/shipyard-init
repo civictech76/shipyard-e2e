@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""shipyard-init — the mechanical half of `/shipyard init` (docs/spec/commands.md).
+
+The command is a guided interview (detect → PROVE by running → confirm); this
+tool does the parts that must be exact:
+
+  shipyard-init detect [--json]     what stack/commands/identity this repo has
+  shipyard-init scaffold --spec <file.json> [--dry-run]
+                                    write the .shipyard/ file set + gates
+
+`detect` never guesses a command works — it only proposes candidates. The
+caller runs each once and passes the survivors to `scaffold`; a command that
+was not executed is never written (the invariant in docs/spec/config.md).
+
+scaffold spec JSON:
+{
+  "repo":     {"owner": "", "name": "", "host": "github|none"},
+  "branches": {"main": "main"},
+  "commands": {"test": "npm test", "lint": ""},      // proven values only
+  "deploy":   {"adapter": "vercel|none|"},
+  "trust":    {"authors": []},
+  "blast_radius": {"paths": ["**/auth/**"]},
+  "budget":   {"per_epic_usd": 0, "per_night_usd": 0, "max_fix_retries": 3},
+  "adapters": ["node"]
+}
+Every field optional; omitted keys keep the template's default.
+
+Exit: 0 ok · 1 refused (existing install, no git) · 2 usage
+"""
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_ROOT = os.path.dirname(HERE)
+AXES = ["typecheck", "test", "lint", "format_check", "build", "dev"]
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+CFG = load(os.path.join(HERE, "shipyard-config"), "shipyard_config")
+
+
+def die(msg, code=1):
+    print(f"shipyard-init: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(args, cwd=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def git_root():
+    r = sh(["git", "rev-parse", "--show-toplevel"])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+# ---------------------------------------------------------------- detect
+
+
+def detect_identity(root):
+    r = sh(["git", "remote", "get-url", "origin"], cwd=root)
+    if r.returncode != 0 or not r.stdout.strip():
+        return {"owner": "", "name": "", "host": "none", "remote": ""}
+    url = r.stdout.strip()
+    m = re.search(r"github\.com[:/]+([^/]+)/(.+?)(?:\.git)?/?$", url)
+    if m:
+        return {"owner": m.group(1), "name": m.group(2), "host": "github", "remote": url}
+    return {"owner": "", "name": "", "host": "none", "remote": url}
+
+
+def detect_main_branch(root):
+    r = sh(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=root)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().rsplit("/", 1)[-1]
+    for cand in ("main", "master"):
+        if sh(["git", "rev-parse", "--verify", cand], cwd=root).returncode == 0:
+            return cand
+    # `symbolic-ref --short HEAD` still answers in a repo with no commits yet,
+    # where `rev-parse --abbrev-ref HEAD` only says "HEAD".
+    r = sh(["git", "symbolic-ref", "--short", "HEAD"], cwd=root)
+    return r.stdout.strip() or "main"
+
+
+def load_adapters():
+    out = []
+    d = os.path.join(PLUGIN_ROOT, "adapters", "stack")
+    if not os.path.isdir(d):
+        return out
+    for fn in sorted(os.listdir(d)):
+        if fn.endswith(".yml"):
+            out.append(CFG.parse(os.path.join(d, fn)))
+    return out
+
+
+def node_scripts(root):
+    p = os.path.join(root, "package.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f).get("scripts", {}) or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def detect(root):
+    files = set(os.listdir(root))
+    adapters = load_adapters()
+    matched, candidates = [], {a: [] for a in AXES}
+
+    for ad in adapters:
+        manifests = ad.get("manifests", [])
+        if not any(m in files for m in manifests):
+            continue
+        matched.append(ad.get("name", "?"))
+        scripts = node_scripts(root) if ad.get("name") == "node" else {}
+        for axis in AXES:
+            for cand in ad.get("candidates", {}).get(axis, []):
+                # "npm run X" is only a candidate if package.json defines script X
+                m = re.match(r"^npm (?:run )?([\w:-]+)$", cand)
+                if m and ad.get("name") == "node" and m.group(1) not in scripts:
+                    continue
+                if cand not in candidates[axis]:
+                    candidates[axis].append(cand)
+
+    tracked = sh(["git", "ls-files"], cwd=root).stdout.split()
+    shape = "existing" if matched or len([f for f in tracked if not f.startswith(".")]) > 3 else "fresh"
+
+    return {
+        "shape": shape,
+        "adapters": matched,
+        "manifests": sorted(f for f in files if f in
+                            {"package.json", "pyproject.toml", "go.mod", "Cargo.toml", "Makefile"}),
+        "repo": detect_identity(root),
+        "main_branch": detect_main_branch(root),
+        "candidates": candidates,
+        "already_initialized": os.path.isfile(os.path.join(root, ".shipyard", "config.yml")),
+    }
+
+
+# ---------------------------------------------------------------- scaffold
+
+
+def set_value(lines, section, key, value):
+    """Replace `key: …` under `section:` in the template, keeping comments."""
+    in_section = section is None
+    out, done = [], False
+    for line in lines:
+        stripped = line.strip()
+        if section and re.match(rf"^{re.escape(section)}:\s*(#.*)?$", line):
+            in_section = True
+            out.append(line)
+            continue
+        if in_section and line and not line[0].isspace() and not line.startswith(("#", "-")):
+            if section and not re.match(rf"^{re.escape(section)}:", line):
+                in_section = False
+        if in_section and not done and re.match(rf"^\s*{re.escape(key)}:", line):
+            indent = line[: len(line) - len(line.lstrip())]
+            comment = ""
+            m = re.search(r"(\s+#.*)$", line)
+            if m and not re.match(r"^\s*#", line):
+                comment = m.group(1)
+            out.append(f"{indent}{key}: {value}{comment}")
+            done = True
+            continue
+        out.append(line)
+    if not done:
+        die(f"template has no {section or ''}.{key} to fill — template/spec drift")
+    return out
+
+
+def set_list(lines, key, items, indent="    "):
+    """Replace a block list under `key:` (top-level or one level in)."""
+    out, i, done = [], 0, False
+    while i < len(lines):
+        line = lines[i]
+        if not done and re.match(rf"^\s*{re.escape(key)}:\s*(\[\])?\s*(#.*)?$", line):
+            pad = line[: len(line) - len(line.lstrip())]
+            comment = ""
+            m = re.search(r"(\s+#.*)$", line)
+            if m:
+                comment = m.group(1)
+            if items:
+                out.append(f"{pad}{key}:{comment}")
+                out.extend(f"{pad}  - \"{it}\"" for it in items)
+            else:
+                out.append(f"{pad}{key}: []{comment}")
+            i += 1
+            while i < len(lines) and re.match(r"^\s*- ", lines[i]):
+                i += 1
+            done = True
+            continue
+        out.append(line)
+        i += 1
+    return out
+
+
+def quote(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return f'"{v}"' if v == "" or re.search(r"[:#\s]", str(v)) else str(v)
+
+
+def build_config(spec):
+    tpl = os.path.join(PLUGIN_ROOT, "templates", "shipyard", "config.yml")
+    with open(tpl, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    repo = spec.get("repo", {})
+    for k in ("owner", "name", "host"):
+        if k in repo:
+            lines = set_value(lines, "repo", k, quote(repo[k]) if k != "host" else repo[k])
+    if "main" in spec.get("branches", {}):
+        lines = set_value(lines, "branches", "main", spec["branches"]["main"])
+
+    for axis in AXES:
+        val = spec.get("commands", {}).get(axis, "")
+        line_val = f'"{val}"' if val else '"" # skipped or unavailable'
+        lines = set_value(lines, "commands", axis, line_val)
+
+    for k in ("adapter", "preview", "production", "health_url"):
+        if k in spec.get("deploy", {}):
+            lines = set_value(lines, "deploy", k, quote(spec["deploy"][k]))
+    for k in ("per_epic_usd", "per_night_usd", "max_fix_retries"):
+        if k in spec.get("budget", {}):
+            lines = set_value(lines, "budget", k, spec["budget"][k])
+    if "approval_label" in spec.get("trust", {}):
+        lines = set_value(lines, "trust", "approval_label", spec["trust"]["approval_label"])
+
+    lines = set_list(lines, "authors", spec.get("trust", {}).get("authors", []))
+    if "paths" in spec.get("blast_radius", {}):
+        lines = set_list(lines, "paths", spec["blast_radius"]["paths"])
+    lines = set_list(lines, "adapters", spec.get("adapters", []))
+    return "\n".join(lines) + "\n"
+
+
+def constitution_block():
+    p = os.path.join(PLUGIN_ROOT, "templates", "constitution", "claude-md-block.md")
+    with open(p, encoding="utf-8") as f:
+        return f.read().rstrip("\n") + "\n"
+
+
+def merge_constitution(existing, block):
+    begin, end = "<!-- shipyard:begin", "<!-- shipyard:end -->"
+    if begin in existing and end in existing:
+        head = existing[: existing.index(begin)]
+        tail = existing[existing.index(end) + len(end) :]
+        return head + block.rstrip("\n") + tail
+    sep = "" if not existing or existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
+    return existing + sep + block
+
+
+def template(name):
+    with open(os.path.join(PLUGIN_ROOT, "templates", "shipyard", name), encoding="utf-8") as f:
+        return f.read()
+
+
+def plugin_version():
+    try:
+        with open(os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+            return json.load(f).get("version", "0")
+    except (OSError, json.JSONDecodeError):
+        return "0"
+
+
+def write_set(root, spec):
+    """Return {relpath: content} for every file init writes (bin/ handled separately)."""
+    files = {}
+    files[".shipyard/config.yml"] = build_config(spec)
+    files[".shipyard/board.md"] = template("board.md")
+    files[".shipyard/prd.md"] = template("prd.md")
+    files[".shipyard/plan.md"] = template("plan.md")
+    files[".shipyard/inbox.md"] = template("inbox.md")
+    files[".shipyard/changes.md"] = template("changes.md")
+    files[".shipyard/specs/.gitkeep"] = ""
+
+    claude_md = ""
+    p = os.path.join(root, "CLAUDE.md")
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as f:
+            claude_md = f.read()
+    files["CLAUDE.md"] = merge_constitution(claude_md, constitution_block())
+
+    if spec.get("repo", {}).get("host") == "github":
+        wf = os.path.join(PLUGIN_ROOT, "templates", "workflows", "shipyard-verify.yml")
+        with open(wf, encoding="utf-8") as f:
+            files[".github/workflows/shipyard-verify.yml"] = f.read()
+    return files
+
+
+def vendored_bin_files():
+    return sorted(f for f in os.listdir(HERE) if f.startswith("shipyard-"))
+
+
+def scaffold(root, spec, dry_run):
+    files = write_set(root, spec)
+    bins = vendored_bin_files()
+
+    if dry_run:
+        print("=== DRY RUN — nothing written ===\n")
+        for rel, content in files.items():
+            print(f"--- {rel} ({len(content.splitlines())} lines) ---")
+            print(content if len(content) < 4000 else content[:4000] + "\n… (truncated)")
+            print()
+        print(f"--- .shipyard/bin/ ← {len(bins)} vendored executables: {', '.join(bins)}")
+        print("--- .shipyard/hooks/pre-push (+ .cmd), git config core.hooksPath .shipyard/hooks")
+        print("--- .shipyard/manifest.json (sha256 of every vendored file + constitution)")
+        return
+
+    for rel, content in files.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    # vendored bin/ — the plugin root does not exist on CI runners
+    bindir = os.path.join(root, ".shipyard", "bin")
+    os.makedirs(bindir, exist_ok=True)
+    manifest = {"plugin_version": plugin_version(), "bin": {}, "constitution_sha256": ""}
+    for fn in bins:
+        src, dst = os.path.join(HERE, fn), os.path.join(bindir, fn)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o755)
+        with open(dst, "rb") as f:
+            manifest["bin"][fn] = hashlib.sha256(f.read()).hexdigest()
+    manifest["constitution_sha256"] = hashlib.sha256(constitution_block().encode()).hexdigest()
+
+    # Ring 1 — versioned hooks dir, chaining anything already installed
+    hooksdir = os.path.join(root, ".shipyard", "hooks")
+    os.makedirs(hooksdir, exist_ok=True)
+    prev = sh(["git", "config", "--get", "core.hooksPath"], cwd=root).stdout.strip()
+    chain = ""
+    if prev and os.path.abspath(os.path.join(root, prev)) != os.path.abspath(hooksdir):
+        chain = f'\n# chain the hooks dir this repo used before Shipyard\n[ -x "{prev}/pre-push" ] && "{prev}/pre-push" "$@" || exit $?\n'
+        manifest["chained_hooks_path"] = prev
+    elif os.path.isfile(os.path.join(root, ".git", "hooks", "pre-push")):
+        chain = '\n# chain the repo\'s pre-existing hook\n[ -x "$(git rev-parse --git-path hooks/pre-push)" ] && "$(git rev-parse --git-path hooks/pre-push)" "$@" || exit $?\n'
+
+    with open(os.path.join(HERE, "shipyard-prepush"), encoding="utf-8") as f:
+        shim = f.read()
+    if chain:
+        shim = shim.replace("exec ", "# (chained hook runs first, below)\n") if False else shim
+    hook = os.path.join(hooksdir, "pre-push")
+    with open(hook, "w", encoding="utf-8") as f:
+        f.write(shim + chain)
+    os.chmod(hook, 0o755)
+    with open(os.path.join(hooksdir, "pre-push.cmd"), "w", encoding="utf-8") as f:
+        f.write('@echo off\r\nsh "%~dp0pre-push" %*\r\n')
+    sh(["git", "config", "core.hooksPath", ".shipyard/hooks"], cwd=root)
+
+    with open(os.path.join(root, ".shipyard", "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+
+    # .env* must be ignored before any secret can be committed
+    gi = os.path.join(root, ".gitignore")
+    have = ""
+    if os.path.isfile(gi):
+        with open(gi, encoding="utf-8") as f:
+            have = f.read()
+    if ".env" not in have:
+        with open(gi, "a", encoding="utf-8") as f:
+            f.write(("" if have.endswith("\n") or not have else "\n") + ".env\n.env.*\n")
+
+    print(f"shipyard-init: wrote {len(files)} files + {len(bins)} vendored executables")
+    print("shipyard-init: follow the whole flow in the dashboard — "
+          "`.shipyard/bin/shipyard-dashboard` → http://127.0.0.1:4173")
+    print("shipyard-init: Ring 1 installed (core.hooksPath = .shipyard/hooks)")
+    if spec.get("repo", {}).get("host") == "github":
+        print("shipyard-init: Ring 2 workflow written — make `shipyard/verify` a REQUIRED check on "
+              f"{spec.get('branches', {}).get('main', 'main')} and epic/* for it to be authoritative")
+
+
+def main(argv):
+    if not argv:
+        die(__doc__.strip(), 2)
+    root = git_root()
+    if not root:
+        die("not a git repository — run `git init` first (a fresh repo is first-class)", 1)
+    cmd = argv[0]
+
+    if cmd == "detect":
+        d = detect(root)
+        print(json.dumps(d, indent=2))
+        return
+
+    if cmd == "scaffold":
+        args = argv[1:]
+        dry = "--dry-run" in args
+        args = [a for a in args if a != "--dry-run"]
+        spec = {}
+        if "--spec" in args:
+            p = args[args.index("--spec") + 1]
+            with open(p, encoding="utf-8") as f:
+                spec = json.load(f)
+        if os.path.isfile(os.path.join(root, ".shipyard", "config.yml")) and not dry:
+            die("already initialized — use `/shipyard upgrade` (or delete .shipyard/ first)", 1)
+        if not spec.get("branches", {}).get("main"):
+            spec.setdefault("branches", {})["main"] = detect_main_branch(root)
+        if "repo" not in spec:
+            spec["repo"] = detect_identity(root)
+        scaffold(root, spec, dry)
+        return
+
+    die(f"unknown subcommand {cmd!r}\n{__doc__}", 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

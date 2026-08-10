@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""shipyard-receipt — record a machine-earned verification receipt (docs/spec/receipts-and-gates.md).
+
+`record` RUNS every non-empty command from .shipyard/config.yml `commands:` and
+writes a receipt only if every one exits 0. A passing receipt cannot be produced
+by asserting anything — only by the commands actually passing. Review lenses are
+recorded as a DECLARATION (a shell can't run a review); the receipt says which
+half was proven and which was promised. Ported from CivicOS verify-receipt.sh,
+with the hardcoded npm gate replaced by the repo's own proven commands.
+
+Usage:
+  shipyard-receipt record [--reviews "a,b,c" --findings N --fixed N] [--notes "..."]
+
+Requires: a clean working tree (a receipt for uncommitted state vouches for nothing).
+Writes:   .shipyard/receipts/<branch-slug>.json (+ logs/), committed by the caller.
+Exit:     0 receipt written · 1 a command failed / dirty tree · 2 usage · 3 no .shipyard
+"""
+
+import datetime
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def die(msg, code=1):
+    print(f"shipyard-receipt: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(args, cwd=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def config(root, *args):
+    r = sh([sys.executable, os.path.join(HERE, "shipyard-config"), *args], cwd=root)
+    if r.returncode not in (0, 1):
+        die(f"config: {r.stderr.strip()}", 3)
+    return r.stdout.rstrip("\n")
+
+
+def main(argv):
+    if not argv or argv[0] != "record":
+        die(__doc__.strip(), 2)
+    args = argv[1:]
+
+    def opt(name, default=None):
+        if name in args:
+            i = args.index(name)
+            v = args[i + 1]
+            del args[i : i + 2]
+            return v
+        return default
+
+    reviews = opt("--reviews", "")
+    findings = int(opt("--findings", "0"))
+    fixed = int(opt("--fixed", "0"))
+    notes = opt("--notes", "")
+    report = opt("--report", "")
+
+    root = config(None, "root")
+    if not root:
+        die("no .shipyard/config.yml — run /shipyard init", 3)
+
+    dirty = [
+        l for l in sh(["git", "status", "--porcelain"], cwd=root).stdout.splitlines()
+        if l.strip() and not l[3:].startswith(".shipyard/receipts/")
+    ]
+    if dirty:
+        die(
+            "working tree is dirty — commit first; a receipt binds to an exact commit:\n  "
+            + "\n  ".join(dirty[:10]),
+            1,
+        )
+
+    head = sh(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip()
+    branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root).stdout.strip()
+    main_branch = config(root, "get", "branches.main") or "main"
+    base = ""
+    for ref in (f"origin/{main_branch}", main_branch):
+        r = sh(["git", "merge-base", ref, "HEAD"], cwd=root)
+        if r.returncode == 0:
+            base = r.stdout.strip()
+            break
+    files_changed = []
+    if base and base != head:
+        files_changed = [
+            f for f in sh(["git", "diff", "--name-only", f"{base}...HEAD"], cwd=root).stdout.splitlines() if f
+        ]
+
+    cmds = [l.split("\t", 1) for l in config(root, "commands").splitlines() if "\t" in l]
+    if not cmds:
+        die("no proven commands in config `commands:` — nothing to earn a receipt with; run /shipyard init", 1)
+
+    slug = branch.replace("/", "-")
+    rdir = os.path.join(root, ".shipyard", "receipts")
+    ldir = os.path.join(rdir, "logs")
+    os.makedirs(ldir, exist_ok=True)
+
+    runs = []
+    for name, cmd in cmds:
+        print(f"[receipt] {name}: {cmd}", flush=True)
+        t0 = time.time()
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, cwd=root)
+        out = (r.stdout or "") + (r.stderr or "")
+        log = os.path.join(ldir, f"{slug}-{name}.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(out)
+        digest = hashlib.sha256(out.encode()).hexdigest()
+        runs.append(
+            {
+                "name": name,
+                "cmd": cmd,
+                "exit": r.returncode,
+                "duration_ms": int((time.time() - t0) * 1000),
+                "log_sha256": digest,
+            }
+        )
+        if r.returncode != 0:
+            tail = "\n".join(out.splitlines()[-15:])
+            die(f"{name} exited {r.returncode} — no receipt written.\n--- last lines ---\n{tail}", 1)
+        print(f"[receipt]   ✓ exit 0 in {runs[-1]['duration_ms']}ms")
+
+    receipt = {
+        "version": 1,
+        "branch": branch,
+        "head_sha": head,
+        "base_sha": base,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "impact": {"files_changed": files_changed, "tests_selected": [], "selection": "full-suite"},
+        "runs": runs,
+        "gauntlet": {
+            "reviews_declared": [s.strip() for s in reviews.split(",") if s.strip()],
+            "report": report,
+            "confirmed": findings,
+            "fixed": fixed,
+        },
+        "notes": notes,
+    }
+    path = os.path.join(rdir, f"{slug}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(receipt, f, indent=2)
+        f.write("\n")
+    print(f"[receipt] written: {os.path.relpath(path, root)} (binds to {head[:10]})")
+    print("[receipt] NOTE: commit the receipt, then push. Any new commit invalidates it — re-record.")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

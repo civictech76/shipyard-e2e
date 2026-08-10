@@ -1,0 +1,63 @@
+# .shipyard/config.yml — written by `/shipyard init`, verified by `/shipyard doctor`.
+# Committed. Secrets NEVER go here — they live in the plugin's userConfig / your env.
+
+repo:
+  owner: civictech76 # e.g. acme
+  name: shipyard-e2e # e.g. widget-app
+  host: github # github | none (local-only mode)
+
+branches:
+  main: main # production branch — protected; only the user's Accept merges here
+  epic_prefix: epic/ # each epic lives on epic/<slug> with its own preview deploy
+
+board:
+  file: .shipyard/board.md
+  statuses:
+    - In consideration
+    - Backlog
+    - Ready for dev
+    - Design review
+    - In progress
+    - In review
+    - On stage
+    - Done
+
+# Detected by init, PROVEN by running each once (exit 0) — never guessed.
+commands:
+  typecheck: "" # skipped or unavailable
+  test: "bash run-tests.sh"
+  lint: "" # skipped or unavailable
+  format_check: "" # skipped or unavailable
+  build: "" # skipped or unavailable
+  dev: "" # skipped or unavailable
+
+deploy:
+  adapter: none # vercel | none | "" (not chosen yet) — see docs/spec/epics-and-deploy.md
+  preview: "" # override: command that deploys a branch to a preview URL (adapter default if empty)
+  production: "" # what an Accept triggers after merge to main (often: nothing — CI does it)
+  health_url: "" # positive health signal (a synthetic transaction, never absence-of-errors)
+
+autonomy:
+  # Everything defaults OFF. Each `arm` step is refused until `doctor` proves its gates.
+  merge_to_epic: false # sub-task PRs auto-merge into their epic branch
+  overnight_build: false # the clock builds the next approved epic while you sleep
+  # There is no production-deploy toggle. Production is always the user's Accept.
+
+trust:
+  # Only work authored/approved by these may enter a build lane. Everything else is triage-only.
+  authors: [] # GitHub logins; empty = repo collaborators with write access
+  approval_label: shipyard-approved
+
+budget:
+  per_epic_usd: 0 # 0 = unlimited; doctor warns
+  per_night_usd: 0
+  max_fix_retries: 3 # after 3 failed fixes: stop, question the architecture, ask
+
+blast_radius:
+  # Paths that always require an explicit human decision, even with autonomy armed.
+  paths:
+    - "**/auth/**"
+    - "**/billing/**"
+    - "**/migrations/**"
+
+adapters: [] # e.g. [node-vitest]

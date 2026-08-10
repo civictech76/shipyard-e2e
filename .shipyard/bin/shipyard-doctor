@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""shipyard-doctor — prove the install is real (docs/spec/commands.md → doctor).
+
+Every deterministic check lives here; `/shipyard doctor` adds the checks that
+need judgment or credentials (running the configured commands, GitHub branch
+protection, trust-set resolution) and prints them in the same table.
+
+Doctor never repairs anything. It reports, and it is honest about which
+enforcement rings are actually live — a green Ring 0 is not a green system.
+
+  shipyard-doctor [--json]
+
+Exit: 0 all green · 1 at least one red · 3 no .shipyard
+"""
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AXES = ["typecheck", "test", "lint", "format_check", "build", "dev"]
+
+SCHEMA = {
+    "repo": {"owner": "str", "name": "str", "host": ["github", "none"]},
+    "branches": {"main": "str", "epic_prefix": "str"},
+    "board": {"file": "str", "statuses": "list"},
+    "commands": {a: "str" for a in AXES},
+    "deploy": {"adapter": ["vercel", "none", ""], "preview": "str", "production": "str", "health_url": "str"},
+    "autonomy": {"merge_to_epic": "bool", "overnight_build": "bool"},
+    "trust": {"authors": "list", "approval_label": "str"},
+    "budget": {"per_epic_usd": "num", "per_night_usd": "num", "max_fix_retries": "num"},
+    "blast_radius": {"paths": "list"},
+    "adapters": "list",
+}
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+CFG = load(os.path.join(HERE, "shipyard-config"), "shipyard_config")
+
+
+def sh(args, cwd=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return None
+        d = p
+
+
+class Checks:
+    def __init__(self, root):
+        self.root = root
+        self.rows = []
+
+    def add(self, name, ok, detail="", fix="", warn=False):
+        self.rows.append(
+            {"check": name, "state": "warn" if (warn and not ok) else ("ok" if ok else "red"),
+             "detail": detail, "fix": fix}
+        )
+        return ok
+
+    # ---------- checks ----------
+
+    def config(self):
+        path = os.path.join(self.root, ".shipyard", "config.yml")
+        try:
+            data = CFG.parse(path)
+        except SystemExit:
+            return self.add("config parses", False, "YAML subset parse failed", "fix the syntax; see docs/spec/config.md"), None
+        except Exception as e:  # noqa: BLE001 — any parse error is a config defect
+            return self.add("config parses", False, str(e), "see docs/spec/config.md"), None
+        self.add("config parses", True, f"{len(data)} sections")
+
+        errors = []
+        for sec, shape in SCHEMA.items():
+            if sec not in data:
+                errors.append(f"missing section `{sec}`")
+                continue
+            if shape == "list":
+                if not isinstance(data[sec], list):
+                    errors.append(f"`{sec}` must be a list")
+                continue
+            if not isinstance(data[sec], dict):
+                errors.append(f"`{sec}` must be a map")
+                continue
+            for key, kind in shape.items():
+                if key not in data[sec]:
+                    errors.append(f"missing key `{sec}.{key}`")
+                    continue
+                v = data[sec][key]
+                if isinstance(kind, list):
+                    if v not in kind:
+                        errors.append(f"`{sec}.{key}` = {v!r}, expected one of {kind}")
+                elif kind == "list" and not isinstance(v, list):
+                    errors.append(f"`{sec}.{key}` must be a list")
+                elif kind == "bool" and v not in ("true", "false"):
+                    errors.append(f"`{sec}.{key}` must be true/false, got {v!r}")
+                elif kind == "num":
+                    try:
+                        float(v)
+                    except (TypeError, ValueError):
+                        errors.append(f"`{sec}.{key}` must be a number, got {v!r}")
+            for key in data[sec] if isinstance(data[sec], dict) else []:
+                if key not in shape:
+                    errors.append(f"unknown key `{sec}.{key}` (a typo silently does nothing)")
+        for sec in data:
+            if sec not in SCHEMA:
+                errors.append(f"unknown section `{sec}`")
+        if data.get("repo", {}).get("host") == "github":
+            for k in ("owner", "name"):
+                if not data["repo"].get(k):
+                    errors.append(f"`repo.{k}` is empty but host is github")
+
+        self.add("config matches schema", not errors,
+                 "; ".join(errors[:4]) + (f" (+{len(errors)-4} more)" if len(errors) > 4 else ""),
+                 "docs/spec/config.md")
+        return not errors, data
+
+    def board(self, data):
+        tool = os.path.join(HERE, "shipyard-board")
+        r = sh([sys.executable, tool, "lint"], cwd=self.root)
+        # The summary is on stdout, the findings on stderr. Reading the last line of
+        # both concatenated meant a warning became the headline of a passing check.
+        summary = (r.stdout.strip().splitlines() or [""])[-1]
+        findings = r.stderr.strip().splitlines()
+        self.add("board valid", r.returncode == 0,
+                 summary or (findings[-1] if findings else ""),
+                 "fix the board grammar / statuses; docs/spec/board.md")
+
+    def constitution(self, manifest):
+        p = os.path.join(self.root, "CLAUDE.md")
+        if not os.path.isfile(p):
+            return self.add("constitution present", False, "no CLAUDE.md", "/shipyard init")
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+        n = text.count("<!-- shipyard:begin")
+        if n != 1 or "<!-- shipyard:end -->" not in text:
+            return self.add("constitution present", False, f"{n} shipyard blocks found, need exactly 1",
+                            "/shipyard upgrade")
+        start = text.index("<!-- shipyard:begin")
+        end = text.index("<!-- shipyard:end -->") + len("<!-- shipyard:end -->")
+        block = text[start:end] + "\n"
+        want = manifest.get("constitution_sha256", "")
+        got = hashlib.sha256(block.encode()).hexdigest()
+        if want and got != want:
+            return self.add("constitution current", False, "block differs from the recorded version",
+                            "/shipyard upgrade")
+        return self.add("constitution present", True, "1 fenced block, hash matches" if want else "1 fenced block")
+
+    def vendored(self, manifest):
+        bindir = os.path.join(self.root, ".shipyard", "bin")
+        recorded = manifest.get("bin", {})
+        if not recorded:
+            return self.add("vendored bin/ intact", False, "manifest records no executables", "/shipyard init")
+        drift = []
+        for fn, want in recorded.items():
+            p = os.path.join(bindir, fn)
+            if not os.path.isfile(p):
+                drift.append(f"{fn}: missing")
+                continue
+            with open(p, "rb") as f:
+                got = hashlib.sha256(f.read()).hexdigest()
+            if got != want:
+                drift.append(f"{fn}: hash drift")
+            elif not os.access(p, os.X_OK):
+                drift.append(f"{fn}: not executable")
+        ok = self.add("vendored bin/ intact", not drift, "; ".join(drift[:3]) or f"{len(recorded)} files",
+                      "/shipyard upgrade (or restore the file)")
+
+        # Intact-but-stale is a different failure: the hashes match the manifest
+        # (nobody tampered) while the plugin has moved on. Only `upgrade` closes
+        # that gap, so doctor has to be the one that notices it.
+        if ok and os.path.isdir(HERE) and os.path.abspath(bindir) != os.path.abspath(HERE):
+            stale = []
+            for fn, want in recorded.items():
+                shipped = os.path.join(HERE, fn)
+                if not os.path.isfile(shipped):
+                    continue
+                with open(shipped, "rb") as f:
+                    if hashlib.sha256(f.read()).hexdigest() != want:
+                        stale.append(fn)
+            if stale:
+                self.add("vendored bin/ current", False,
+                         f"{len(stale)} file(s) older than the installed plugin: "
+                         + ", ".join(sorted(stale)[:3]),
+                         "/shipyard upgrade", warn=True)
+        return ok
+
+    def ring1(self):
+        hp = sh(["git", "config", "--get", "core.hooksPath"], cwd=self.root).stdout.strip()
+        hook = os.path.join(self.root, ".shipyard", "hooks", "pre-push")
+        ok = hp == ".shipyard/hooks" and os.path.isfile(hook) and os.access(hook, os.X_OK)
+        detail = f"core.hooksPath={hp or 'unset'}" + ("" if os.path.isfile(hook) else ", pre-push missing")
+        return self.add("Ring 1 (pre-push hook) live", ok, detail,
+                        "git config core.hooksPath .shipyard/hooks && chmod +x .shipyard/hooks/pre-push")
+
+    def ring2(self, data):
+        if data.get("repo", {}).get("host") != "github":
+            return self.add("Ring 2 (required CI check)", False,
+                            "host: none — no server-side ring exists; local-only mode",
+                            "add a GitHub remote and re-run init to enable Ring 2", warn=True)
+        wf = os.path.join(self.root, ".github", "workflows", "shipyard-verify.yml")
+        ok = os.path.isfile(wf)
+        return self.add("Ring 2 workflow present", ok,
+                        "shipyard-verify.yml" if ok else "no workflow — verification is not enforced server-side",
+                        "/shipyard init (rewrites the workflow)")
+
+    def git_shape(self, data):
+        main = data.get("branches", {}).get("main", "main")
+        exists = sh(["git", "rev-parse", "--verify", main], cwd=self.root).returncode == 0
+        # A repo with no commits has no branches yet — the first commit creates one.
+        # That is the normal state of a fresh repo, not a broken install.
+        unborn = sh(["git", "rev-parse", "HEAD"], cwd=self.root).returncode != 0
+        if unborn:
+            self.add(f"branch `{main}` exists", False,
+                     "no commits yet — your first commit creates it", "", warn=True)
+        else:
+            self.add(f"branch `{main}` exists", exists, "", f"git branch {main}")
+        dirty = sh(["git", "status", "--porcelain"], cwd=self.root).stdout.strip()
+        self.add("working tree", True, f"{len(dirty.splitlines())} uncommitted change(s)" if dirty else "clean")
+
+    def secrets(self):
+        base = os.path.join(self.root, ".shipyard")
+        suspects = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in ("receipts", "bin")]
+            for fn in filenames:
+                if not fn.endswith((".md", ".yml", ".yaml", ".json")) or fn == "manifest.json":
+                    continue
+                p = os.path.join(dirpath, fn)
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        text = f.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for tok in re.findall(r"[A-Za-z0-9+/_\-]{32,}", text):
+                    if re.fullmatch(r"[0-9a-f]{32,}", tok) or "-" in tok and tok.count("-") > 3:
+                        continue  # hex digests and slug-like paths
+                    # Prose reads as noise to an entropy test: a review document's
+                    # "launchd/TCC/PATH/wake-timing/non-deterministic" is long and
+                    # varied and scores like a credential. Words joined by -, / or _
+                    # are language; a real token's segments are not words. A warning
+                    # that is always wrong is one people learn to ignore.
+                    parts = [p for p in re.split(r"[-/_]", tok) if p]
+                    if len(parts) >= 3 and all(p.isalpha() for p in parts):
+                        continue
+                    counts = {c: tok.count(c) for c in set(tok)}
+                    entropy = -sum((n / len(tok)) * math.log2(n / len(tok)) for n in counts.values())
+                    if entropy > 4.2:
+                        suspects.append(f"{os.path.relpath(p, self.root)}: {tok[:12]}…")
+        self.add("no secrets in .shipyard/", not suspects, "; ".join(suspects[:3]),
+                 "move it to your platform's secret store — config is committed")
+
+        gi = os.path.join(self.root, ".gitignore")
+        ignored = False
+        if os.path.isfile(gi):
+            with open(gi, encoding="utf-8") as f:
+                ignored = bool(re.search(r"^\.env", f.read(), re.M))
+        self.add(".env* gitignored", ignored, "", "add `.env` and `.env.*` to .gitignore")
+
+    def receipts(self, data):
+        d = os.path.join(self.root, ".shipyard", "receipts")
+        if not os.path.isdir(d):
+            return
+        branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root).stdout.strip()
+        slug = branch.replace("/", "-")
+        if os.path.isfile(os.path.join(d, f"{slug}.json")):
+            r = sh([sys.executable, os.path.join(HERE, "shipyard-verify"), "check"], cwd=self.root)
+            self.add(f"receipt for `{branch}`", r.returncode == 0,
+                     (r.stdout + r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else "",
+                     "shipyard-receipt record")
+
+
+def main(argv):
+    root = find_root()
+    if not root:
+        print("shipyard-doctor: no .shipyard/config.yml found — run `/shipyard init`", file=sys.stderr)
+        sys.exit(3)
+
+    manifest = {}
+    mp = os.path.join(root, ".shipyard", "manifest.json")
+    if os.path.isfile(mp):
+        try:
+            with open(mp, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except json.JSONDecodeError:
+            manifest = {}
+
+    c = Checks(root)
+    ok, data = c.config()
+    data = data or {}
+    if ok or data:
+        c.board(data)
+    c.constitution(manifest)
+    c.vendored(manifest)
+    ring1 = c.ring1()
+    ring2 = c.ring2(data)
+    c.git_shape(data)
+    c.secrets()
+    c.receipts(data)
+
+    reds = [r for r in c.rows if r["state"] == "red"]
+    warns = [r for r in c.rows if r["state"] == "warn"]
+
+    if "--json" in argv:
+        print(json.dumps({"rows": c.rows, "ring0": "plugin", "ring1": ring1, "ring2": ring2,
+                          "ready": not reds}, indent=2))
+        sys.exit(1 if reds else 0)
+
+    width = max(len(r["check"]) for r in c.rows)
+    print()
+    for r in c.rows:
+        mark = {"ok": "✓", "warn": "!", "red": "✗"}[r["state"]]
+        line = f"  {mark} {r['check'].ljust(width)}  {r['detail']}"
+        print(line.rstrip())
+        if r["state"] != "ok" and r["fix"]:
+            print(f"    {' ' * width}  fix: {r['fix']}")
+    print()
+    print(f"  Ring 0 (session hooks): shipped with the plugin — advisory")
+    print(f"  Ring 1 (git pre-push):  {'live' if ring1 else 'NOT live'}")
+    print(f"  Ring 2 (required CI):   {'workflow present' if ring2 else 'NOT enforced'}"
+          f"{'' if ring2 else ' — this is the only ring a model cannot bypass'}")
+    print()
+    if reds:
+        print(f"  NOT READY — {len(reds)} check(s) red. Fix them before trusting this install.")
+    elif warns:
+        print(f"  Ready, with {len(warns)} caveat(s) above (autonomy stays locked without Ring 2).")
+    else:
+        print("  Ready.")
+    print()
+    sys.exit(1 if reds else 0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

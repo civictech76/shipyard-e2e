@@ -1,0 +1,15 @@
+{
+  "plugin_version": "0.2.4",
+  "bin": {
+    "shipyard-board": "7cf7560e6e28537454d2460cb4431262bb6ab2093a6b1318e41c8adbb729645e",
+    "shipyard-config": "ca9d34d732dcd3a2a8f6ccd065fb675613a245c2ce98f77b435058bf015b06e3",
+    "shipyard-dashboard": "9a1d5e657942f84388dd0dfc828c28680ba35e1d61689a8f98f624c0e28b2ac8",
+    "shipyard-doctor": "7c511654830aad7a580eb98ddbe3a6c30d53aadaae1a71d0b7cdd36f8f110253",
+    "shipyard-init": "70cd58ba03c46884c03d361dbae6c5380e547059688bad1bebfb2e39fd01d7df",
+    "shipyard-prepush": "068252cebf0c329644bcae5526f961b3adf95a210d489e3d314eb320f35171a1",
+    "shipyard-receipt": "3e1aa596001f985c4b31e6bdc05c9f37a07efabe9d4f79be9e498693a160643a",
+    "shipyard-status": "9fe51d7c3e1b6e7f27fc52429046cf22e1b360822f987935c366860224ffe941",
+    "shipyard-verify": "e07b54ab5dfc22bafd2369e174b171af147588e0c6ac75a9d495cece4d284796"
+  },
+  "constitution_sha256": "9416d97b03596c8ad030e490436ac3f77eaeb914947acc1b515d28a14d7a6c26"
+}
