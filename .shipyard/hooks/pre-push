@@ -1,0 +1,14 @@
+#!/bin/sh
+# shipyard-prepush — Ring 1 git pre-push shim (docs/spec/receipts-and-gates.md).
+# Installed by /shipyard init as .shipyard/hooks/pre-push (core.hooksPath).
+#
+# Git hands the ref list on stdin, readable ONCE (CivicOS #5459) — this shim
+# passes it straight through to the single gate. All logic lives in
+# shipyard-verify so it stays testable; this file stays too small to be wrong.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+if [ -x "$ROOT/.shipyard/bin/shipyard-verify" ]; then
+  exec "$ROOT/.shipyard/bin/shipyard-verify" pre-push       # vendored layout
+elif [ -x "$(dirname "$0")/shipyard-verify" ]; then
+  exec "$(dirname "$0")/shipyard-verify" pre-push           # plugin/dev layout
+fi
+exit 0

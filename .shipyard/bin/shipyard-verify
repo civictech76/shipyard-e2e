@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""shipyard-verify — validate a verification receipt (docs/spec/receipts-and-gates.md).
+
+Used by Ring 1 (git pre-push, via shipyard-prepush) and Ring 2 (CI). Checks that
+the commit being pushed is vouched for by a receipt covering every configured
+command with exit 0, with no confirmed review finding left unfixed. Ported from
+CivicOS verify-receipt-gate.sh.
+
+A commit verifies one of two ways (docs/spec/receipts-and-gates.md §Merges):
+
+  V1 direct — SOME receipt committed in its tree vouches for it, the only
+              difference between the vouched commit and this one being
+              Shipyard's own bookkeeping.
+  V2 merge  — it is a merge commit, every path in it matches that path's state
+              in at least one parent, and every parent itself verifies.
+
+V1 says "some receipt", not "the receipt named after this branch". Receipts are
+named for a branch but vouch for CONTENT, and a merge always lands that content
+under a different branch name and a new sha — which is why the old name-keyed
+lookup deadlocked every epic branch the moment a sub-task merged into it.
+
+V2's path rule is a security boundary, not bookkeeping. "Both parents verified,
+therefore the merge is verified" is FALSE: a merge commit's tree is
+unconstrained, so anyone can hang an arbitrary tree off two green parents. What
+is checked instead is that the merge introduced NOTHING — every path in it, and
+every path missing from it, matches a parent. A hand-edited conflict
+resolution, an injected file and a quietly deleted test all fail closed and
+demand a fresh receipt.
+
+Neither rule is the whole gate. A receipt is a claim a session can write; the
+proof is Ring 2 re-running every configured command on the merged tree, where
+no session can reach it.
+
+Usage:
+  shipyard-verify check [--ref <sha>]     # verify HEAD (or a specific commit)
+  shipyard-verify pre-push                # read "<lref> <lsha> <rref> <rsha>" lines on stdin
+
+pre-push scope: refs matching branches.epic_prefix or branches.main are gated;
+other branches pass (docs/spec/receipts-and-gates.md Ring 1). Deletions pass.
+ALLOW_UNVERIFIED_PUSH=1 bypasses with a loud warning — deliberate and visible,
+never accidental.
+
+Exit: 0 valid · 1 invalid (reason printed) · 3 no .shipyard (passes in pre-push mode)
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ZERO = "0" * 40
+
+# Paths whose changes never invalidate a receipt: Shipyard's own bookkeeping.
+# NOT included, deliberately: .shipyard/config.yml (defines the commands) and
+# .shipyard/specs/ (define the acceptance criteria) — both change the meaning
+# of "verified" and so require a fresh receipt.
+BOOKKEEPING = re.compile(
+    r"^\.shipyard/(receipts/|reviews/|board\.md$|inbox\.md$|changes\.md$|ledger\.json$)"
+)
+
+
+def sh(args, cwd=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def config(root, *args):
+    r = sh([sys.executable, os.path.join(HERE, "shipyard-config"), *args], cwd=root)
+    return r.stdout.rstrip("\n") if r.returncode in (0, 1) else None
+
+
+def find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return None
+        d = p
+
+
+def fail(msg):
+    print(f"shipyard-verify: FAIL — {msg}", file=sys.stderr)
+    print(
+        "fix: commit your work, run `shipyard-receipt record` (re-run after ANY new commit), "
+        "commit the receipt, push again.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+class Missing:
+    """A log git could not produce. Mirrors CompletedProcess so callers stay simple."""
+
+    returncode = 1
+    stdout = ""
+
+
+_COMMANDS = {}
+
+
+def required_commands(root):
+    """{name: cmd} from config, read once. A deep merge walk asks per receipt per
+    commit; shelling out to shipyard-config each time turned a bounded walk into
+    thousands of subprocesses."""
+    if root not in _COMMANDS:
+        _COMMANDS[root] = {
+            l.split("\t", 1)[0]: l.split("\t", 1)[1]
+            for l in (config(root, "commands") or "").splitlines()
+            if "\t" in l
+        }
+    return _COMMANDS[root]
+
+
+def receipts_at(root, sha, prefer=None, allow_disk=False):
+    """Every receipt committed in the tree at `sha`, as (slug, raw, read_log).
+
+    `prefer` (a branch slug) is tried first so the common case still produces the
+    most specific error message.
+
+    `allow_disk` falls back to the working copy when the commit carries no
+    receipts at all. That is a convenience for one case only — `record` writes to
+    disk, and a session may reasonably run `check` before committing it — and it
+    is OFF everywhere else. A receipt lying in the working tree says nothing about
+    the commit being PUSHED: it can vouch for a tree whose receipt was never
+    committed, so Ring 1 would pass a push that Ring 2 then rejects for a missing
+    receipt. Ring 1 and the merge walk therefore read only what is committed.
+    """
+    found = []
+    r = sh(["git", "ls-tree", "-r", "-z", "--name-only", sha, "--", ".shipyard/receipts/"], cwd=root)
+    if r.returncode == 0:
+        for p in r.stdout.split("\0"):
+            if p.endswith(".json") and p.count("/") == 2:
+                found.append(p.rsplit("/", 1)[1][:-5])
+
+    def from_git(slug):
+        raw = sh(["git", "show", f"{sha}:.shipyard/receipts/{slug}.json"], cwd=root).stdout
+        return raw, lambda name: sh(
+            ["git", "show", f"{sha}:.shipyard/receipts/logs/{slug}-{name}.log"], cwd=root
+        )
+
+    if not found and allow_disk:
+        rdir = os.path.join(root, ".shipyard", "receipts")
+        if os.path.isdir(rdir):
+            found = [f[:-5] for f in sorted(os.listdir(rdir)) if f.endswith(".json")]
+
+        def from_disk(slug):
+            with open(os.path.join(rdir, f"{slug}.json"), encoding="utf-8") as f:
+                raw = f.read()
+
+            def read_log(name):
+                p = os.path.join(rdir, "logs", f"{slug}-{name}.log")
+                if not os.path.isfile(p):
+                    return Missing()
+                with open(p, encoding="utf-8") as f:
+                    return type("R", (), {"returncode": 0, "stdout": f.read()})
+
+            return raw, read_log
+
+        load = from_disk
+    else:
+        load = from_git
+
+    found.sort(key=lambda s: (s != prefer, s))
+    for slug in found:
+        try:
+            raw, read_log = load(slug)
+        except OSError as e:
+            yield slug, None, str(e)
+            continue
+        yield slug, (raw, read_log), None
+
+
+def receipt_sound(root, raw, read_log):
+    """Is this receipt internally valid? Says nothing about WHICH commit it covers.
+
+    A receipt is a claim, and a session could hand-write both the JSON and the
+    logs it hashes — that is why Ring 2 re-runs the commands rather than trusting
+    this. What these checks buy is that a receipt cannot be *quietly* wrong: it
+    has to name the configured commands, carry their logs, and account for every
+    confirmed review finding.
+    """
+    try:
+        rec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"does not parse: {e}"
+    if rec.get("version") != 1:
+        return None, f"unknown receipt version {rec.get('version')!r}"
+
+    required = required_commands(root)
+    runs = {r.get("name"): r for r in rec.get("runs", [])}
+    for name, cmd in required.items():
+        run = runs.get(name)
+        if not run:
+            return None, f"configured command {name!r} has no run in it"
+        if run.get("exit") != 0:
+            return None, f"{name} recorded exit {run.get('exit')}"
+        if not str(run.get("cmd", "")).startswith(cmd):
+            return None, f"{name} ran {run.get('cmd')!r}, config says {cmd!r} — doesn't match config"
+        lg = read_log(name)
+        if lg.returncode != 0:
+            return None, f"log for {name} missing"
+        if hashlib.sha256(lg.stdout.encode()).hexdigest() != run.get("log_sha256"):
+            return None, f"log for {name} does not hash-match it"
+
+    g = rec.get("gauntlet", {})
+    if g.get("confirmed", 0) != g.get("fixed", 0):
+        return None, (
+            f"{g.get('confirmed')} confirmed finding(s) but only {g.get('fixed')} fixed — "
+            "the no-tech-debt rule is structural (docs/spec/gauntlet.md)"
+        )
+    return rec, None
+
+
+def direct_verdict(root, sha, prefer=None, label=None, allow_disk=False):
+    """V1 — does a receipt in this commit's tree vouch for this commit's content?
+
+    The receipt vouches for the CODE at a tree, so commits that only touch
+    Shipyard's own bookkeeping do not invalidate it — the receipt commit itself,
+    and the board/inbox/change/review moves that follow a build. If a board move
+    invalidated verification, every project would hit "stale receipt" on routine
+    bookkeeping and learn to bypass the gate, which is precisely the failure the
+    gate exists to prevent. Anything that can change what "verified" MEANS still
+    invalidates: source code, config.yml (it defines the commands) and the specs
+    (they define the acceptance criteria).
+    """
+    reasons = []
+    for slug, loaded, err in receipts_at(root, sha, prefer, allow_disk):
+        if loaded is None:
+            reasons.append(f"{slug}.json: {err}")
+            continue
+        raw, read_log = loaded
+        rec, why = receipt_sound(root, raw, read_log)
+        if rec is None:
+            reasons.append(f"{slug}.json: {why}")
+            continue
+        vouched = rec.get("head_sha", "")
+        if vouched == sha:
+            return True, f"{slug}.json binds to {sha[:10]}"
+        r = sh(["git", "diff", "--name-only", "-z", f"{vouched}..{sha}"], cwd=root)
+        if r.returncode != 0:
+            reasons.append(f"{slug}.json: vouches for {vouched[:10]}, unreachable from here")
+            continue
+        extras = [f for f in r.stdout.split("\0") if f and not BOOKKEEPING.match(f)]
+        if extras:
+            reasons.append(
+                f"{slug}.json: stale — vouches for {vouched[:10]}, which differs in "
+                + ", ".join(extras[:4])
+                + (f" (+{len(extras) - 4} more)" if len(extras) > 4 else "")
+            )
+            continue
+        return True, f"{slug}.json binds to {vouched[:10]}, bookkeeping only since"
+    if not reasons:
+        reasons.append(
+            f"no receipt for branch {label!r} — nothing under .shipyard/receipts/"
+            if label
+            else "no receipt is committed at this commit"
+        )
+    return False, reasons
+
+
+def tree_entries(root, sha):
+    """path -> (mode, blob) for every file in the tree. None if unreadable."""
+    r = sh(["git", "ls-tree", "-r", "-z", sha], cwd=root)
+    if r.returncode != 0:
+        return None
+    out = {}
+    for ent in r.stdout.split("\0"):
+        if not ent:
+            continue
+        meta, _, path = ent.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 3 and path:
+            out[path] = (parts[0], parts[2])
+    return out
+
+
+def merge_introduces_nothing(root, sha, parents):
+    """V2's security check: every path matches its state in at least one parent.
+
+    Content AND absence. A path present in every parent but missing here was
+    deleted BY the merge — dropping a test file is the cheapest way to make a
+    command suite pass, so that direction has to be closed too. A path whose blob
+    matches no parent was authored by the merge, whether by conflict resolution
+    or by `git commit-tree` with a doctored tree; either way nothing verified it.
+    """
+    here = tree_entries(root, sha)
+    if here is None:
+        return False, f"cannot read the tree at {sha[:10]}"
+    theirs = []
+    for p in parents:
+        t = tree_entries(root, p)
+        if t is None:
+            return False, f"cannot read the tree at parent {p[:10]}"
+        theirs.append(t)
+
+    introduced, deleted = [], []
+    paths = set(here)
+    for t in theirs:
+        paths |= set(t)
+    for path in sorted(paths):
+        if BOOKKEEPING.match(path):
+            continue
+        state = here.get(path)
+        if any(t.get(path) == state for t in theirs):
+            continue
+        (deleted if state is None else introduced).append(path)
+
+    if introduced:
+        return False, (
+            f"merge {sha[:10]} carries content found in no parent: "
+            + ", ".join(introduced[:5])
+            + (f" (+{len(introduced) - 5} more)" if len(introduced) > 5 else "")
+            + " — a merge may combine verified work, never author new work"
+        )
+    if deleted:
+        return False, (
+            f"merge {sha[:10]} deletes paths present in every parent: "
+            + ", ".join(deleted[:5])
+            + (f" (+{len(deleted) - 5} more)" if len(deleted) > 5 else "")
+            + " — that deletion was never verified"
+        )
+    return True, None
+
+
+# A merge chain longer than this is not a shape any project reaches honestly, and
+# the walk should be bounded rather than trusted. Squash merges never chain at
+# all: the merged tree equals the sub-task's tree, so V1 settles them in one step.
+MAX_MERGE_DEPTH = 200
+
+
+def verify_commit(root, sha, prefer=None, memo=None, depth=0, label=None, allow_disk=False):
+    """(ok, reason) — is this commit verified by V1, or by V2 all the way down?"""
+    memo = {} if memo is None else memo
+    if sha in memo:
+        return memo[sha]
+    if depth > MAX_MERGE_DEPTH:
+        return False, (
+            f"merge history deeper than {MAX_MERGE_DEPTH} unverified commits — "
+            "record a fresh receipt on this branch"
+        )
+    memo[sha] = (False, "cycle in the commit graph")  # git has none; belt and braces
+
+    # allow_disk applies to the commit actually asked about, never to a parent in
+    # the merge walk — a parent's proof has to be committed history.
+    ok, detail = direct_verdict(root, sha, prefer, label, allow_disk)
+    if ok:
+        memo[sha] = (True, detail)
+        return memo[sha]
+    direct_reasons = detail
+
+    parents = sh(["git", "log", "-1", "--format=%P", sha], cwd=root).stdout.split()
+    if len(parents) < 2:
+        memo[sha] = (False, "no receipt vouches for this commit:\n  - " + "\n  - ".join(direct_reasons))
+        return memo[sha]
+
+    clean, why = merge_introduces_nothing(root, sha, parents)
+    if not clean:
+        memo[sha] = (False, why)
+        return memo[sha]
+
+    for p in parents:
+        pok, pwhy = verify_commit(root, p, None, memo, depth + 1)
+        if not pok:
+            memo[sha] = (
+                False,
+                f"merge {sha[:10]} introduces nothing new, but its parent {p[:10]} "
+                f"is not verified:\n  {pwhy}",
+            )
+            return memo[sha]
+    memo[sha] = (True, f"merge of {len(parents)} verified parents, introducing nothing")
+    return memo[sha]
+
+
+def check_receipt(root, branch, target_sha, allow_disk=False):
+    ok, detail = verify_commit(
+        root, target_sha, branch.replace("/", "-"), label=branch, allow_disk=allow_disk
+    )
+    if not ok:
+        return fail(detail)
+    print(f"shipyard-verify: OK — {branch}@{target_sha[:10]} verified ({detail})")
+    return 0
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+    mode, args = argv[0], argv[1:]
+    root = find_root()
+
+    if mode == "check":
+        if not root:
+            print("shipyard-verify: no .shipyard here", file=sys.stderr)
+            sys.exit(3)
+        ref = args[args.index("--ref") + 1] if "--ref" in args else "HEAD"
+        sha = sh(["git", "rev-parse", ref], cwd=root).stdout.strip()
+        if not sha:
+            print(f"shipyard-verify: cannot resolve {ref!r}", file=sys.stderr)
+            sys.exit(1)
+        # The receipt is named for the branch it vouches for, and it lives ON that
+        # branch — a caller checking another branch (the dashboard renders from
+        # wherever it was started) must say which, not inherit the current HEAD.
+        if "--branch" in args:
+            branch = args[args.index("--branch") + 1]
+        elif ref != "HEAD" and ref.startswith(("refs/heads/", "epic/")) or "/" in ref:
+            branch = ref.replace("refs/heads/", "")
+        else:
+            branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root).stdout.strip()
+        # `rev-parse --abbrev-ref HEAD` answers "HEAD" when the checkout is detached,
+        # which is what `actions/checkout` does on pull_request. Asking for HEAD.json
+        # then reports a missing receipt — a true statement about the wrong thing,
+        # and it meant Ring 2 could never pass on a PR. Say what is actually wrong.
+        if branch == "HEAD":
+            print("shipyard-verify: detached HEAD — cannot tell which branch this is.\n"
+                  "fix: pass --branch <name>. CI checks out a detached HEAD on "
+                  "pull_request; the shipped workflow passes it for you.", file=sys.stderr)
+            sys.exit(1)
+        # Only when you are asking about your own HEAD may an uncommitted receipt
+        # answer: that is the `record` → `check` → commit sequence. Ask about any
+        # other commit and the answer has to come from committed history.
+        head = sh(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip()
+        sys.exit(check_receipt(root, branch, sha, allow_disk=(sha == head)))
+
+    if mode == "pre-push":
+        if not root:
+            sys.exit(0)  # repo not initialized for Shipyard — nothing to enforce
+        if os.environ.get("ALLOW_UNVERIFIED_PUSH") == "1":
+            print(
+                "shipyard-verify: ⚠ ALLOW_UNVERIFIED_PUSH=1 — pushing WITHOUT verification. "
+                "This is recorded in your shell history, and Ring 2 will still re-run the gate.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+        prefix = config(root, "get", "branches.epic_prefix") or "epic/"
+        main_branch = config(root, "get", "branches.main") or "main"
+        rc = 0
+        for line in sys.stdin.read().splitlines():
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            lref, lsha, rref, _ = parts
+            if lsha == ZERO:
+                continue  # deletion ships no code — never demands a receipt
+            short = rref.rsplit("refs/heads/", 1)[-1]
+            if not (short == main_branch or short.startswith(prefix)):
+                continue
+            branch = lref.rsplit("refs/heads/", 1)[-1]
+            r = check_receipt(root, branch, lsha)
+            rc = rc or r
+        sys.exit(rc)
+
+    print(f"shipyard-verify: unknown mode {mode!r}", file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

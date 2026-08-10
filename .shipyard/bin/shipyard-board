@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""shipyard-board — the PM agent's hands on .shipyard/board.md (docs/spec/board.md).
+
+The board is the single source of truth for work state; every mutation here is
+one git commit touching only the board file. Replaces CivicOS's GitHub-Projects
+GraphQL scripts with the markdown board: no tokens, no org setup, works anywhere.
+
+Usage:
+  shipyard-board lint
+  shipyard-board move E<n> "<status>"          [--no-commit]
+  shipyard-board check E<n>.<m> --proof <sha>  [--no-commit]
+  shipyard-board add-epic "<title>" [--branch <b>] [--status "<s>"] [--depends E<k>] [--no-commit]
+  shipyard-board add-task E<n> "<title>" --spec specs/<f>.md [--prd "<ref>"] [--no-commit]
+  shipyard-board annotate E<n> "<note>"        [--no-commit]
+  shipyard-board pause E<n> --reason <conflict|change:<id>|budget> [--no-commit]
+  shipyard-board resume E<n>                   [--no-commit]
+
+Exit: 0 ok · 1 lint findings / illegal operation · 2 usage · 3 no .shipyard
+"""
+
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+EPIC_RE = re.compile(
+    r"^### \[E(?P<num>\d+)\] (?P<title>.+?) · branch (?P<branch>\S+)"
+    r" · preview: (?P<preview>\S+) · status: (?P<status>[^·]+?)"
+    r"(?: · paused: (?P<paused>.+?))?(?: · depends: (?P<depends>E\d+(?:, ?E\d+)*))?\s*$"
+)
+TASK_RE = re.compile(
+    r"^- \[(?P<done>[ x])\] \[E(?P<epic>\d+)\.(?P<num>\d+)\] (?P<title>.+?)"
+    r" → (?P<spec>specs/\S+\.md)(?: · prd: (?P<prd>.+?))?"
+    r"(?: · done: (?P<proof>[0-9a-f]{7,40}))?\s*$"
+)
+
+
+def die(msg, code=2):
+    print(f"shipyard-board: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def config(root, *args):
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shipyard-config")
+    r = sh([sys.executable, tool, *args], cwd=root)
+    if r.returncode not in (0, 1):
+        die(f"config error: {r.stderr.strip()}", 3)
+    return r.stdout.rstrip("\n")
+
+
+def find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            die("no .shipyard/config.yml found — run /shipyard init", 3)
+        d = parent
+
+
+class Board:
+    def __init__(self, root):
+        self.root = root
+        rel = config(root, "get", "board.file") or ".shipyard/board.md"
+        self.path = os.path.join(root, rel)
+        self.rel = rel
+        self.statuses = [s for s in config(root, "statuses").splitlines() if s]
+        if not self.statuses:
+            die("config board.statuses is empty", 1)
+        with open(self.path, encoding="utf-8") as f:
+            self.lines = f.read().splitlines()
+
+    # ---------- parsing ----------
+
+    def sections(self):
+        """[(status, start_idx, end_idx_exclusive)] in file order."""
+        out, current, start = [], None, None
+        for i, ln in enumerate(self.lines):
+            if ln.startswith("## "):
+                if current is not None:
+                    out.append((current, start, i))
+                current, start = ln[3:].strip(), i
+        if current is not None:
+            out.append((current, start, len(self.lines)))
+        return out
+
+    def epics(self):
+        """[(match, line_idx, section_status)]"""
+        out = []
+        secs = self.sections()
+
+        def section_of(i):
+            for s, a, b in secs:
+                if a <= i < b:
+                    return s
+            return None
+
+        for i, ln in enumerate(self.lines):
+            if ln.startswith("### "):
+                m = EPIC_RE.match(ln)
+                out.append((m, i, section_of(i)))
+        return out
+
+    def epic_block(self, idx):
+        """(start, end) line span of the epic at heading line idx (incl. tasks/notes)."""
+        end = idx + 1
+        while end < len(self.lines) and not self.lines[end].startswith(("## ", "### ")):
+            end += 1
+        return idx, end
+
+    def find_epic(self, num):
+        for m, i, sec in self.epics():
+            if m and int(m.group("num")) == num:
+                return m, i, sec
+        die(f"epic E{num} not found on the board", 1)
+
+    # ---------- lint ----------
+
+    def lint(self):
+        """(errors, warnings). Errors block a commit; warnings never do. A board
+        written before a rule existed must stay usable — an unlintable board
+        refuses every mutation, which is a worse failure than the one being fixed."""
+        errors, warnings = [], []
+        found = [s for s, _, _ in self.sections()]
+        if found != self.statuses:
+            errors.append(
+                f"sections {found!r} do not match config board.statuses {self.statuses!r} (order matters)"
+            )
+        seen = {}
+        for m, i, sec in self.epics():
+            ln = self.lines[i]
+            if not m:
+                errors.append(f"line {i+1}: epic heading does not match the grammar: {ln!r}")
+                continue
+            n = int(m.group("num"))
+            if n in seen:
+                errors.append(f"line {i+1}: duplicate epic number E{n} (first at line {seen[n]+1})")
+            seen[n] = i
+            if m.group("status").strip() != (sec or ""):
+                errors.append(
+                    f"line {i+1}: E{n} status field {m.group('status').strip()!r} != its section {sec!r}"
+                )
+            for dep in re.findall(r"E\d+", m.group("depends") or ""):
+                if dep not in [f"E{x.group('num')}" for x, _, _ in self.epics() if x]:
+                    errors.append(f"line {i+1}: E{n} depends on {dep}, which is not on the board")
+            pz = m.group("paused")
+            if pz and not re.match(r"^(conflict|change:\S+|budget)$", pz.strip()):
+                errors.append(f"line {i+1}: E{n} paused reason {pz!r} not conflict|change:<id>|budget")
+        for i, ln in enumerate(self.lines):
+            if re.match(r"^- \[", ln):
+                m = TASK_RE.match(ln)
+                if not m:
+                    errors.append(f"line {i+1}: sub-task does not match the grammar: {ln!r}")
+                elif m.group("done") == "x" and not m.group("proof"):
+                    t = f"E{m.group('epic')}.{m.group('num')}"
+                    warnings.append(
+                        f"line {i+1}: {t} is checked but names no proof commit — "
+                        f"re-check it with `check {t} --proof <sha>`"
+                    )
+        return errors, warnings
+
+    # ---------- transitions ----------
+
+    def legal(self, frm, to):
+        S = self.statuses
+        if frm == to:
+            return True
+        try:
+            i, j = S.index(frm), S.index(to)
+        except ValueError:
+            return False
+        if j == i + 1:
+            return True  # forward one step
+        if "Design review" in S and frm == S[S.index("Design review") - 1] and j == i + 2:
+            return True  # backend epics skip Design review (reason recorded by caller)
+        if frm == "On stage" and to == "In progress":
+            return True  # reject with notes
+        if to == "Backlog":
+            return True  # a change request demotes
+        return False
+
+    def guard_ready(self, num, to):
+        """Entering Ready for dev/In progress requires spec'd sub-tasks."""
+        if to not in ("Ready for dev", "In progress"):
+            return
+        _, idx, _ = self.find_epic(num)
+        a, b = self.epic_block(idx)
+        tasks = [TASK_RE.match(l) for l in self.lines[a:b] if re.match(r"^- \[", l)]
+        tasks = [t for t in tasks if t]
+        if to == "In progress" and not tasks:
+            die(f"E{num} cannot enter 'In progress': it has no sub-tasks", 1)
+        for t in tasks:
+            spec = os.path.join(self.root, ".shipyard", t.group("spec"))
+            if not os.path.isfile(spec):
+                die(
+                    f"E{num} cannot enter {to!r}: sub-task E{t.group('epic')}.{t.group('num')} "
+                    f"points at missing {t.group('spec')} — acceptance criteria live there",
+                    1,
+                )
+
+    # ---------- mutations ----------
+
+    def move(self, num, to):
+        if to not in self.statuses:
+            die(f"unknown status {to!r} (config board.statuses)", 1)
+        m, idx, frm = self.find_epic(num)
+        if not self.legal(frm, to):
+            die(f"illegal transition for E{num}: {frm!r} → {to!r} (docs/spec/board.md)", 1)
+        if frm == to:
+            return None
+        self.guard_ready(num, to)
+        a, b = self.epic_block(idx)
+        block = self.lines[a:b]
+        block[0] = re.sub(r" · status: [^·]+?(?=( · paused:| · depends:|$))", f" · status: {to}", block[0])
+        del self.lines[a:b]
+        for s, sa, sb in self.sections():
+            if s == to:
+                insert = sb
+                while insert > sa + 1 and self.lines[insert - 1].strip() == "":
+                    insert -= 1
+                self.lines[insert:insert] = block + [""]
+                return f"board(E{num}): {frm} → {to}"
+        die(f"section {to!r} vanished mid-edit", 1)
+
+    def bookkeeping(self, path):
+        """The board's own record-keeping: the board file, the manifest, receipts.
+        Everything else under `.shipyard/` — specs, prd, plan, config — is a real
+        deliverable. Rejecting the whole directory blocked honest work: a setup
+        sub-task whose deliverable IS the tool paths written into its spec could
+        not be ticked at all."""
+        return (path == self.rel
+                or path == ".shipyard/manifest.json"
+                or path.startswith(".shipyard/receipts/"))
+
+    def proof_commit(self, proof):
+        """Resolve `proof` to a short sha, refusing anything that is not evidence
+        that work happened. A commit that only moves the board is bookkeeping —
+        the board vouching for itself is what a checked box must never rest on."""
+        r = sh(["git", "rev-parse", "--verify", "--quiet", f"{proof}^{{commit}}"], cwd=self.root)
+        if r.returncode != 0 or not r.stdout.strip():
+            die(f"proof {proof!r} is not a commit in this repository", 1)
+        sha = sh(["git", "rev-parse", "--short=10", r.stdout.strip()],
+                 cwd=self.root).stdout.strip()
+        files = sh(["git", "show", "--name-only", "--format=", sha],
+                   cwd=self.root).stdout.split()
+        if not files:
+            die(f"proof {sha} changes no files — it cannot be evidence of work", 1)
+        if all(self.bookkeeping(f) for f in files):
+            die(f"proof {sha} only moves the board — bookkeeping is not evidence of work", 1)
+        return sha
+
+    def check(self, epic, task, proof):
+        """Checking a box is a claim about work. It has to name the commit it rests
+        on, so a reader can compare what the box says against what the commit did —
+        the mismatch that a green test run and a valid receipt both sail past."""
+        pat = re.compile(rf"^- \[ \] \[E{epic}\.{task}\] ")
+        for i, ln in enumerate(self.lines):
+            if pat.match(ln):
+                sha = self.proof_commit(proof)
+                self.lines[i] = ln.replace("- [ ]", "- [x]", 1).rstrip() + f" · done: {sha}"
+                return f"board(E{epic}.{task}): done ({sha})"
+        if any(re.match(rf"^- \[x\] \[E{epic}\.{task}\] ", l) for l in self.lines):
+            return None  # already done — idempotent
+        die(f"sub-task E{epic}.{task} not found", 1)
+
+    def add_epic(self, title, branch, status, depends):
+        """`depends` is a comma-separated list: an epic can genuinely need two
+        others (the digest AND the capture) and a single slot silently loses one."""
+        if status not in self.statuses:
+            die(f"unknown status {status!r}", 1)
+        nums = [int(m.group("num")) for m, _, _ in self.epics() if m]
+        n = max(nums, default=0) + 1
+        prefix = config(self.root, "get", "branches.epic_prefix") or "epic/"
+        if not branch:
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:32]
+            branch = f"{prefix}{slug}"
+        head = f"### [E{n}] {title} · branch {branch} · preview: - · status: {status}"
+        if depends:
+            ids = [d.strip() for d in str(depends).split(",") if d.strip()]
+            for d in ids:
+                if not re.fullmatch(r"E\d+", d):
+                    die(f"bad --depends {d!r}: expected E<n> or E<n>,E<m>", 1)
+            head += " · depends: " + ", ".join(ids)
+        for s, sa, sb in self.sections():
+            if s == status:
+                self.lines[sb:sb] = [head, ""]
+                print(f"E{n}")
+                return f"board(E{n}): added to {status}"
+        die(f"section {status!r} not found", 1)
+
+    def add_task(self, epic, title, spec, prd):
+        _, idx, _ = self.find_epic(epic)
+        a, b = self.epic_block(idx)
+        nums = [
+            int(t.group("num"))
+            for t in (TASK_RE.match(l) for l in self.lines[a:b])
+            if t and int(t.group("epic")) == epic
+        ]
+        m = max(nums, default=0) + 1
+        line = f"- [ ] [E{epic}.{m}] {title} → {spec}"
+        if prd:
+            line += f" · prd: {prd}"
+        insert = b
+        while insert > a + 1 and self.lines[insert - 1].strip() == "":
+            insert -= 1
+        self.lines[insert:insert] = [line]
+        print(f"E{epic}.{m}")
+        return f"board(E{epic}.{m}): added"
+
+    def annotate(self, num, note):
+        _, idx, _ = self.find_epic(num)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.lines[idx + 1 : idx + 1] = [f"> {stamp} — {note}"]
+        return f"board(E{num}): note"
+
+    def set_paused(self, num, reason):
+        m, idx, _ = self.find_epic(num)
+        ln = self.lines[idx]
+        ln = re.sub(r" · paused: [^·]+?(?=( · depends:|$))", "", ln)
+        if reason:
+            if " · depends:" in ln:
+                ln = ln.replace(" · depends:", f" · paused: {reason} · depends:", 1)
+            else:
+                ln += f" · paused: {reason}"
+        self.lines[idx] = ln
+        return f"board(E{num}): {'paused — ' + reason if reason else 'resumed'}"
+
+    # ---------- persistence ----------
+
+    def save(self, message, commit=True):
+        # Collapse the blank lines that moving blocks between sections leaves
+        # behind, so a board that has seen 50 moves reads like a fresh one.
+        squeezed, blanks = [], 0
+        for ln in self.lines:
+            if ln.strip():
+                squeezed.append(ln)
+                blanks = 0
+            else:
+                blanks += 1
+                if blanks == 1:
+                    squeezed.append("")
+        self.lines = squeezed
+        text = "\n".join(self.lines).rstrip("\n") + "\n"
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+        errors, _ = Board(self.root).lint()
+        if errors:
+            die("refusing to commit a board that fails lint:\n  " + "\n  ".join(errors), 1)
+        if commit and message:
+            sh(["git", "add", self.rel], cwd=self.root)
+            r = sh(["git", "commit", "-m", message, "--", self.rel], cwd=self.root)
+            if r.returncode != 0 and "nothing to commit" not in r.stdout + r.stderr:
+                die(f"git commit failed: {(r.stderr or r.stdout).strip()}", 1)
+
+
+def parse_epic(s):
+    m = re.fullmatch(r"E(\d+)", s)
+    if not m:
+        die(f"expected E<n>, got {s!r}")
+    return int(m.group(1))
+
+
+def main(argv):
+    if not argv:
+        die(__doc__.strip())
+    commit = "--no-commit" not in argv
+    argv = [a for a in argv if a != "--no-commit"]
+    cmd, args = argv[0], argv[1:]
+    board = Board(find_root())
+
+    if cmd == "lint":
+        errors, warnings = board.lint()
+        for e in errors:
+            print(e, file=sys.stderr)
+        for w in warnings:
+            print(f"warn: {w}", file=sys.stderr)
+        state = "OK" if not errors else f"{len(errors)} finding(s)"
+        if warnings:
+            state += f", {len(warnings)} warning(s)"
+        print(f"board: {state} ({len([m for m, _, _ in board.epics() if m])} epics)")
+        sys.exit(1 if errors else 0)
+
+    def opt(name, default=None):
+        if name in args:
+            i = args.index(name)
+            v = args[i + 1]
+            del args[i : i + 2]
+            return v
+        return default
+
+    if cmd == "move" and len(args) >= 2:
+        msg = board.move(parse_epic(args[0]), args[1])
+    elif cmd == "check":
+        proof = opt("--proof")
+        if len(args) != 1 or not proof:
+            die("usage: check E<n>.<m> --proof <commit>"
+                " — a checked box must name the commit it rests on")
+        m = re.fullmatch(r"E(\d+)\.(\d+)", args[0])
+        if not m:
+            die(f"expected E<n>.<m>, got {args[0]!r}")
+        msg = board.check(int(m.group(1)), int(m.group(2)), proof)
+    elif cmd == "add-epic":
+        branch, status = opt("--branch"), opt("--status", "Backlog")
+        depends = opt("--depends")   # "E2" or "E1,E3" — a real plan has both shapes
+        if len(args) != 1:
+            die("usage: add-epic \"<title>\" [--branch b] [--status s] [--depends E<k>]")
+        msg = board.add_epic(args[0], branch, status, depends)
+    elif cmd == "add-task":
+        spec, prd = opt("--spec"), opt("--prd")
+        if len(args) != 2 or not spec:
+            die("usage: add-task E<n> \"<title>\" --spec specs/<f>.md [--prd ref]")
+        msg = board.add_task(parse_epic(args[0]), args[1], spec, prd)
+    elif cmd == "annotate" and len(args) == 2:
+        msg = board.annotate(parse_epic(args[0]), args[1])
+    elif cmd == "pause":
+        reason = opt("--reason")
+        if len(args) != 1 or not reason:
+            die("usage: pause E<n> --reason <conflict|change:<id>|budget>")
+        msg = board.set_paused(parse_epic(args[0]), reason)
+    elif cmd == "resume" and len(args) == 1:
+        msg = board.set_paused(parse_epic(args[0]), None)
+    else:
+        die(f"unknown or malformed subcommand: {cmd} {' '.join(args)}\n\n{__doc__.strip()}")
+
+    if msg is None:
+        print("no change")
+        return
+    board.save(msg, commit=commit)
+    print(msg)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

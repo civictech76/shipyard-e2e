@@ -1,0 +1,92 @@
+# Shipyard Ring 2 — the authoritative verification gate (docs/spec/receipts-and-gates.md).
+#
+# The receipt written locally is a CLAIM. This workflow is the PROOF: it validates the
+# receipt against the pushed tree AND re-runs the repo's configured commands here, where
+# no session can reach them. Make `shipyard/verify` a REQUIRED status check on your
+# production branch and on epic/* — that is what makes verification unskippable.
+#
+# Written by `/shipyard init`. Safe to edit; `/shipyard upgrade` will show a diff.
+name: shipyard/verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - "epic/**"
+
+jobs:
+  verify:
+    name: shipyard/verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # receipts bind to shas; the gate needs history
+
+      # --branch is not optional: `actions/checkout` leaves a DETACHED HEAD on
+      # pull_request, so the tool cannot work out which branch it is looking at and
+      # every PR fails with a missing receipt. The receipt is named for the branch
+      # it vouches for, so the head ref is what has to be passed.
+      #
+      # It goes through `env:`, never straight into `run:`. A branch name is
+      # attacker-chosen on a fork PR, and git permits `"`, `;`, `$` and backticks in
+      # one; `${{ }}` pastes raw text in before bash parses the line, so the inline
+      # form is a shell-injection hole in the very job that is meant to be the gate
+      # a session cannot bypass. Quoted "$HEAD_REF" is data, whatever it contains.
+      - name: Validate the receipt against this tree
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+        run: |
+          python3 .shipyard/bin/shipyard-verify check --ref "$HEAD_SHA" --branch "$HEAD_REF"
+
+      # Re-run the gate here. A forged or stale receipt dies on this step: the receipt
+      # says the commands passed, this proves it on the tree that is actually being merged.
+      - name: Set up Node (skipped when the repo has no package.json)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies
+        if: hashFiles('package.json') != ''
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Re-run every configured command
+        run: |
+          set -euo pipefail
+          python3 .shipyard/bin/shipyard-config commands | while IFS=$'\t' read -r name cmd; do
+            echo "::group::$name — $cmd"
+            bash -c "$cmd"
+            echo "::endgroup::"
+          done
+
+      - name: Blast-radius check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # `contains(...)` yields the literal true/false, so this one is not injectable —
+          # it goes through env: anyway. "Never interpolate into run:" is a rule people can
+          # hold; "never interpolate unless you have reasoned it safe" is one they cannot,
+          # and the exception is what the next edit copies.
+          BLAST_OK: ${{ contains(github.event.pull_request.labels.*.name, 'shipyard-blast-radius-ok') }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          [ -n "$base" ] || base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          changed="$(git diff --name-only "$base"...HEAD || true)"
+          hit=""
+          while read -r pattern; do
+            [ -n "$pattern" ] || continue
+            for f in $changed; do
+              case "$f" in ${pattern#\*\*/}|$pattern) hit="$hit $f" ;; esac
+            done
+          done < <(python3 .shipyard/bin/shipyard-config list blast_radius.paths)
+          if [ -n "$hit" ]; then
+            echo "Touches blast-radius paths:$hit"
+            echo "These require an explicit human decision — apply the agreed label/approval before merging."
+            if [ "$BLAST_OK" != "true" ]; then
+              exit 1
+            fi
+          fi

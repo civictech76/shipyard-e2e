@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""shipyard-dashboard — the local control surface (docs/spec/dashboard.md).
+
+Thin by construction: it owns no database and runs no agents. Every read is
+re-derived from git and `.shipyard/` on request, so the page can never disagree
+with reality, and every write goes through the same `bin/` tools the CLI uses.
+
+  shipyard-dashboard [--port 4173] [--host 127.0.0.1] [--no-open]
+
+## Security posture (local mode)
+
+Loopback-bound by default. A password on a 127.0.0.1 server protects nothing the
+OS is not already protecting, so there is no login — but "no login" is not "no
+security", and the two threats that are real here ARE handled:
+
+  1. Loopback binding. `--host` anything else demands SHIPYARD_DASHBOARD_ALLOW_
+     REMOTE=1 and prints what that exposes, because the moment this listens on a
+     LAN address, "anyone who can reach it can merge to production" is true.
+  2. CSRF. Any page in your browser can POST to localhost. Every mutating call
+     needs a per-process token that only this server's own page carries, plus a
+     same-origin check. Without it, a random site could merge an epic to
+     production in the background.
+
+No credential is ever stored: GitHub actions shell out to the `gh` you already
+authenticated.
+
+## Hosted later (owner decision, 2026-08-09)
+
+The split below is what makes a hosted mode additive rather than a rewrite:
+`State`/`Actions` are transport-agnostic and take an `Identity`; only `Handler`
+knows about HTTP. Hosted mode adds an Identity backed by GitHub OAuth and a
+per-request repo checkout — it does not touch the layers underneath.
+"""
+
+import argparse
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import socketserver
+import subprocess
+import sys
+import urllib.parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ASSETS = os.path.join(os.path.dirname(HERE), "dashboard", "public")
+
+
+def sh(args, cwd=None, text_input=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd, input=text_input)
+
+
+def tool(name, *args, cwd=None):
+    """Run one of the sibling bin/ tools (vendored copy wins, as in CI)."""
+    root = cwd or os.getcwd()
+    vendored = os.path.join(root, ".shipyard", "bin", name)
+    path = vendored if os.path.isfile(vendored) else os.path.join(HERE, name)
+    return sh([sys.executable, path, *args], cwd=root)
+
+
+# --------------------------------------------------------------------------
+# Identity — trivial locally, the seam a hosted mode grows into.
+# --------------------------------------------------------------------------
+
+
+class Identity:
+    """Who is acting. Local mode: the machine's owner, implicitly."""
+
+    def __init__(self, kind="local-owner", login=None):
+        self.kind = kind
+        self.login = login
+
+    def may_accept(self):
+        # Local: reaching the loopback port IS the authorisation. Hosted mode
+        # replaces this with a repo-permission check on the OAuth identity.
+        return self.kind == "local-owner"
+
+    def describe(self):
+        return "you (local)" if self.kind == "local-owner" else f"@{self.login}"
+
+
+# --------------------------------------------------------------------------
+# State — everything re-derived, nothing cached.
+# --------------------------------------------------------------------------
+
+EPIC_RE = re.compile(
+    r"^### \[E(?P<num>\d+)\] (?P<title>.+?) · branch (?P<branch>\S+)"
+    r" · preview: (?P<preview>\S+) · status: (?P<status>[^·]+?)"
+    r"(?: · paused: (?P<paused>.+?))?(?: · depends: (?P<depends>E\d+(?:, ?E\d+)*))?\s*$"
+)
+TASK_RE = re.compile(
+    r"^- \[(?P<done>[ x])\] \[E(?P<epic>\d+)\.(?P<num>\d+)\] (?P<title>.+?)"
+    r" → (?P<spec>specs/\S+\.md)(?: · prd: (?P<prd>.+?))?"
+    r"(?: · done: (?P<proof>[0-9a-f]{7,40}))?\s*$"
+)
+
+
+class State:
+    def __init__(self, root):
+        self.root = root
+
+    # ---- small readers ----
+
+    def _cfg(self, *args):
+        r = tool("shipyard-config", *args, cwd=self.root)
+        return r.stdout.rstrip("\n") if r.returncode in (0, 1) else ""
+
+    def _read(self, rel):
+        p = os.path.join(self.root, rel)
+        if not os.path.isfile(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    # ---- pieces ----
+
+    def project(self):
+        host = self._cfg("get", "repo.host") or "none"
+        owner, name = self._cfg("get", "repo.owner"), self._cfg("get", "repo.name")
+        branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root).stdout.strip()
+        head = sh(["git", "rev-parse", "--short", "HEAD"], cwd=self.root).stdout.strip()
+        return {
+            "name": name or os.path.basename(self.root),
+            "slug": f"{owner}/{name}" if owner and name else os.path.basename(self.root),
+            "host": host,
+            "main": self._cfg("get", "branches.main") or "main",
+            "branch": branch,
+            "head": head,
+        }
+
+    def rings(self):
+        r = tool("shipyard-doctor", "--json", cwd=self.root)
+        try:
+            d = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return {"ring1": False, "ring2": False, "ready": False, "reds": ["doctor did not run"]}
+        return {
+            "ring1": bool(d.get("ring1")),
+            "ring2": bool(d.get("ring2")),
+            "ready": bool(d.get("ready")),
+            "reds": [x["check"] + (f" — {x['detail']}" if x.get("detail") else "")
+                     for x in d.get("rows", []) if x.get("state") == "red"],
+        }
+
+    def _spec_goal(self, spec_rel):
+        text = self._read(os.path.join(".shipyard", spec_rel))
+        m = re.search(r"^## Goal\s*\n(.*?)(?=\n## |\Z)", text, re.S | re.M)
+        if not m:
+            return ""
+        body = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip()
+        return " ".join(body.split())[:240]
+
+    def epics(self):
+        board = self._read(self._cfg("get", "board.file") or ".shipyard/board.md").splitlines()
+        statuses = [s for s in self._cfg("statuses").splitlines() if s]
+        section, out = None, []
+        for line in board:
+            if line.startswith("## "):
+                section = line[3:].strip()
+            elif line.startswith("### "):
+                m = EPIC_RE.match(line)
+                if m:
+                    out.append({
+                        "id": f"E{m.group('num')}",
+                        "num": int(m.group("num")),
+                        "title": m.group("title"),
+                        "branch": m.group("branch"),
+                        "preview": None if m.group("preview") == "-" else m.group("preview"),
+                        "status": section,
+                        "paused": m.group("paused"),
+                        "depends": re.findall(r"E\d+", m.group("depends") or ""),
+                        "tasks": [],
+                        "goal": "",
+                    })
+            elif out and line.startswith("- ["):
+                m = TASK_RE.match(line)
+                if m and int(m.group("epic")) == out[-1]["num"]:
+                    out[-1]["tasks"].append({
+                        "id": f"E{m.group('epic')}.{m.group('num')}",
+                        "title": m.group("title"),
+                        "done": m.group("done") == "x",
+                        "spec": m.group("spec"),
+                    })
+                    if not out[-1]["goal"]:
+                        out[-1]["goal"] = self._spec_goal(m.group("spec"))
+
+        by_id = {e["id"]: e for e in out}
+        for e in out:
+            e["branch_exists"] = sh(["git", "rev-parse", "--verify", e["branch"]],
+                                    cwd=self.root).returncode == 0
+            e["receipt"] = self._receipt(e["branch"]) if e["branch_exists"] else None
+            e["criteria"] = self._criteria(e)
+            e["blockers"] = self._blockers(e, by_id, statuses)
+            e["can_accept"] = e["status"] == "On stage" and not e["blockers"]
+        return out
+
+    def _criteria(self, epic):
+        """Whose move is it on this epic's acceptance criteria?
+
+        queued — the architect owes a draft (nothing for the user to do)
+        review — drafted, waiting on the user's OK
+        None   — settled
+
+        The user never writes criteria. They approve them, the same way they
+        approve a mockup or a merge.
+        """
+        for tsk in epic["tasks"]:
+            text = self._read(os.path.join(".shipyard", tsk["spec"]))
+            if "shipyard:criteria-review" in text:
+                m = re.search(r"^## Acceptance criteria\s*\n(.*?)(?=\n## |\Z)", text, re.S | re.M)
+                body = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip() if m else ""
+                return {"state": "review", "spec": tsk["spec"], "draft": body}
+            if "shipyard:needs-criteria" in text:
+                return {"state": "queued", "spec": tsk["spec"], "draft": ""}
+        return None
+
+    def _receipt(self, branch):
+        # The receipt lives ON the epic branch, not in whatever is checked out —
+        # the dashboard is usually rendering from main. Ask git, not the filesystem.
+        slug = branch.replace("/", "-")
+        exists = sh(["git", "cat-file", "-e", f"{branch}:.shipyard/receipts/{slug}.json"],
+                    cwd=self.root).returncode == 0
+        if not exists:
+            return {"state": "none", "detail": "no receipt recorded on this branch"}
+        head = sh(["git", "rev-parse", branch], cwd=self.root).stdout.strip()
+        r = tool("shipyard-verify", "check", "--ref", head, "--branch", branch, cwd=self.root)
+        detail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        return {
+            "state": "valid" if r.returncode == 0 else "invalid",
+            "detail": detail[0].replace("shipyard-verify: ", "") if detail else "",
+        }
+
+    def _blockers(self, epic, by_id, statuses):
+        out = []
+        if epic["status"] != "On stage":
+            return out
+        if not epic["branch_exists"]:
+            out.append(f"branch {epic['branch']} does not exist")
+        elif (epic["receipt"] or {}).get("state") != "valid":
+            out.append(f"receipt {(epic['receipt'] or {}).get('state', 'missing')} — re-record before accepting")
+        for dep in epic["depends"]:
+            parent = by_id.get(dep)
+            if parent and parent["status"] != "Done":
+                out.append(f"{dep} ({parent['title']}) is not accepted yet — this branch contains its commits")
+        if epic["paused"]:
+            out.append(f"paused: {epic['paused']}")
+        return out
+
+    def inbox(self):
+        text = self._read(".shipyard/inbox.md")
+        open_q, answered = [], []
+        current = None
+        for line in text.splitlines():
+            m = re.match(r"^- \[( |x)\] (Q\d+)(?: \((E\d+)\))? (.+)$", line)
+            if m:
+                current = {"id": m.group(2), "epic": m.group(3), "text": m.group(4), "answer": ""}
+                (answered if m.group(1) == "x" else open_q).append(current)
+            elif current is not None and line.strip().startswith("→"):
+                current["answer"] = line.strip()[1:].strip()
+        return {"open": open_q, "answered": answered}
+
+    def changes(self):
+        text = self._read(".shipyard/changes.md")
+        out, current = [], None
+        done_from = text.find("\n## Done")
+        for m in re.finditer(r"^## (C\d+) — (.+)$", text, re.M):
+            body_start = m.end()
+            nxt = text.find("\n## ", body_start)
+            body = text[body_start: nxt if nxt != -1 else len(text)]
+            body = re.sub(r"<!--.*?-->", "", body, flags=re.S).strip()
+            disp = ""
+            dm = re.search(r"^Disposition:\s*(.+)$", body, re.M | re.S)
+            if dm:
+                disp = dm.group(1).strip()
+            out.append({
+                "id": m.group(1),
+                "title": m.group(2),
+                "body": body,
+                "disposition": disp,
+                "resolved": done_from != -1 and m.start() > done_from,
+            })
+        return out
+
+    APPROVABLE = {
+        "prd":  (".shipyard/prd.md",  "PRD"),
+        "plan": (".shipyard/plan.md", "Plan"),
+    }
+
+    def artifact(self, key):
+        """Read one of the flow's artifacts for review. Whitelisted by key — the
+        dashboard never serves an arbitrary path, however it is spelled."""
+        if key in self.APPROVABLE:
+            rel, title = self.APPROVABLE[key]
+        elif key.startswith("specs/") and key.endswith(".md") and ".." not in key:
+            rel, title = os.path.join(".shipyard", key), key
+        else:
+            raise ActionError(f"{key!r} is not a readable artifact")
+        text = self._read(rel)
+        if not text:
+            raise ActionError(f"{rel} does not exist yet")
+        return {"key": key, "title": title, "path": rel, "markdown": text,
+                "approved": self._approved(text)}
+
+    @staticmethod
+    def _approved(text):
+        # The marker carries a date AND who approved it, so the pattern must not
+        # demand the date be the last thing before the close.
+        m = re.search(r"<!--\s*shipyard:approved\s+(\S+)[^>]*-->", text)
+        return m.group(1) if m else None
+
+    def journey(self, epics):
+        """Where the project is in the flow — derived, never stored.
+
+        Steps 0-5 happen once and are genuinely linear. Steps 6-7 repeat per
+        epic, forever, so the journey hands over to the board there rather than
+        pretending a progress bar still means something.
+        """
+        def has_content(rel, section=None):
+            text = self._read(rel)
+            if section:
+                m = re.search(rf"^## {re.escape(section)}\b[^\n]*\n(.*?)(?=\n## |\Z)", text, re.S | re.M)
+                text = m.group(1) if m else ""
+            stripped = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+            stripped = re.sub(r"^#.*$", "", stripped, flags=re.M)
+            return len(stripped.strip()) > 40
+
+        prd_text, plan_text = self._read(".shipyard/prd.md"), self._read(".shipyard/plan.md")
+        prd_ok, plan_ok = self._approved(prd_text), self._approved(plan_text)
+        prd_done = has_content(".shipyard/prd.md", "Problem")
+        stack_done = has_content(".shipyard/prd.md", "Tech stack")
+        planned = has_content(".shipyard/plan.md") and bool(epics)
+        reviews = os.path.join(self.root, ".shipyard", "reviews")
+        gauntlet = os.path.isdir(reviews) and any(
+            f.endswith(".md") for f in os.listdir(reviews)) if os.path.isdir(reviews) else False
+        building = [e for e in epics if e["status"] not in
+                    ("In consideration", "Backlog", "Ready for dev", "Done")]
+        shipped = [e for e in epics if e["status"] == "Done"]
+
+        steps = [
+            {"n": 0, "title": "Set up", "blurb": "Your commands proven, the gates installed.",
+             "done": True, "artifact": ".shipyard/config.yml", "next": None},
+            {"n": 1, "title": "Your idea", "blurb": "A thought, or a document you already wrote.",
+             "done": prd_done, "artifact": None, "next": '/idea "…"  or  /prd <file>'},
+            {"n": 2, "title": "The PRD", "blurb": "An interview turns it into something you would show a client. Non-goals matter most.",
+             "done": prd_done, "artifact": ".shipyard/prd.md" if prd_done else None,
+             "review": "prd" if prd_done else None, "approved": prd_ok, "next": '/idea "…"'},
+            {"n": 3, "title": "The stack", "blurb": "A concrete proposal with rationale. You pick.",
+             "done": stack_done, "artifact": ".shipyard/prd.md" if stack_done else None, "next": "/shipyard plan"},
+            {"n": 4, "title": "The plan", "blurb": "Epics and sub-tasks, each with a named proof of done.",
+             "done": planned, "artifact": ".shipyard/plan.md" if planned else None,
+             "review": "plan" if planned else None, "approved": plan_ok, "next": "/shipyard plan"},
+            {"n": 5, "title": "Review the plan", "blurb": "The gauntlet attacks the PRD and plan before a line of code exists.",
+             "done": gauntlet, "artifact": ".shipyard/reviews/" if gauntlet else None, "next": "/shipyard plan"},
+        ]
+        for s in steps:
+            s["state"] = "done" if s["done"] else "todo"
+        first_todo = next((s for s in steps if not s["done"]), None)
+        if first_todo:
+            first_todo["state"] = "now"
+
+        # The spec is explicit: nothing is built until the user approves the
+        # reviewed plan. So the loop opens on APPROVAL, not on the plan existing.
+        loop_open = bool(planned and gauntlet and plan_ok)
+        return {
+            "steps": steps,
+            "loop": {
+                "open": loop_open,
+                "state": ("shipping" if shipped else "building" if building else
+                          "ready" if loop_open else "locked"),
+                "locked_because": (None if loop_open else
+                                   "the plan is not written yet" if not planned else
+                                   "the plan has not been reviewed by the gauntlet" if not gauntlet else
+                                   "you have not approved the plan yet"),
+                "building": [e["id"] for e in building],
+                "shipped": [e["id"] for e in shipped],
+                "total": len(epics),
+                "blurb": ("Build and accept repeat once per epic — the board below is the truth "
+                          "from here on, not a progress bar."),
+            },
+        }
+
+    def snapshot(self, identity):
+        epics = self.epics()
+        return {
+            "project": self.project(),
+            "journey": self.journey(epics),
+            "rings": self.rings(),
+            "statuses": [s for s in self._cfg("statuses").splitlines() if s],
+            "epics": epics,
+            "inbox": self.inbox(),
+            "changes": self.changes(),
+            "identity": identity.describe(),
+            "mode": "local",
+        }
+
+
+# --------------------------------------------------------------------------
+# Actions — every write goes through the same tools the CLI uses.
+# --------------------------------------------------------------------------
+
+
+class Actions:
+    def __init__(self, root, state):
+        self.root, self.state = root, state
+
+    def _board(self, *args):
+        r = tool("shipyard-board", *args, cwd=self.root)
+        if r.returncode != 0:
+            raise ActionError((r.stderr or r.stdout).strip() or "board refused the move")
+        return r.stdout.strip()
+
+    def _append(self, rel, text, under=None):
+        p = os.path.join(self.root, rel)
+        body = ""
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                body = f.read()
+        if under and under in body:
+            i = body.index(under) + len(under)
+            body = body[:i] + "\n" + text + body[i:]
+        else:
+            body = body.rstrip("\n") + "\n\n" + text + "\n"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def _commit(self, paths, message):
+        sh(["git", "add", "--"] + paths, cwd=self.root)
+        sh(["git", "commit", "-m", message, "--"] + paths, cwd=self.root)
+
+    # ---- the actions the panes call ----
+
+    def epic_add(self, identity, title, status="In consideration"):
+        """New epic. Lands in In consideration by default: it is the one status
+        that asks nothing of an idea yet, so capturing a thought never requires
+        writing acceptance criteria first."""
+        title = " ".join(title.split())
+        if not title:
+            raise ActionError("an epic needs a title")
+        out = self._board("add-epic", title, "--status", status)
+        eid = out.splitlines()[0].strip()
+        return {"ok": True, "message": f"{eid} added to {status}.", "id": eid}
+
+    def task_add(self, identity, epic, title):
+        """Add work to an epic. Creates the spec file if the epic has none, and
+        marks it as needing criteria — the board tool will not let the epic start
+        without one, so a task added here is honest about being unfinished rather
+        than looking ready."""
+        title = " ".join(title.split())
+        if not title:
+            raise ActionError("the work needs a one-line description")
+        e = self._epic(epic)
+        spec = e["tasks"][0]["spec"] if e["tasks"] else None
+        if not spec:
+            slug = re.sub(r"[^a-z0-9]+", "-", e["title"].lower()).strip("-")[:32] or f"e{e['num']}"
+            spec = f"specs/{slug}.md"
+        path = os.path.join(self.root, ".shipyard", spec)
+        if not os.path.isfile(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# [{epic}] {e['title']}\n\n<!-- shipyard:needs-criteria -->\n\n"
+                        f"## Goal\n\n## Acceptance criteria\n\n<!-- Machine-checkable, one per line. "
+                        f"An item without them is not ready to build. -->\n\n## Proof of done\n\n"
+                        f"## Sub-tasks\n")
+        out = self._board("add-task", epic, title, "--spec", spec)
+        tid = out.splitlines()[0].strip()
+        self._commit([os.path.join(".shipyard", spec)], f"spec({epic}): stub for {tid}")
+        return {"ok": True, "id": tid,
+                "message": f"{tid} added to {epic}. The architect will draft what 'done' means and "
+                           f"show it to you for approval — nothing for you to write."}
+
+    def artifact_approve(self, identity, key):
+        rel, title = self.state.APPROVABLE.get(key, (None, None))
+        if not rel:
+            raise ActionError(f"{key!r} cannot be approved")
+        path = os.path.join(self.root, rel)
+        text = self._readfile(path)
+        text = re.sub(r"\n?<!--\s*shipyard:approved[^>]*-->\n?", "\n", text)
+        text = text.rstrip("\n") + f"\n\n<!-- shipyard:approved {today()} by {identity.describe()} -->\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self._commit([rel], f"docs(shipyard): {key} approved")
+        extra = " The build loop is open." if key == "plan" else ""
+        return {"ok": True, "message": f"{title} approved.{extra}"}
+
+    def artifact_note(self, identity, key, text):
+        if not text.strip():
+            raise ActionError("say what should be different — that is what the agent redrafts from")
+        rel, title = self.state.APPROVABLE.get(key, (None, None))
+        if not rel:
+            if key.startswith("specs/") and key.endswith(".md") and ".." not in key:
+                rel, title = os.path.join(".shipyard", key), key
+            else:
+                raise ActionError(f"{key!r} is not a reviewable artifact")
+        path = os.path.join(self.root, rel)
+        body = self._readfile(path)
+        # A note un-approves: the thing you approved is not the thing you now want.
+        body = re.sub(r"\n?<!--\s*shipyard:approved[^>]*-->\n?", "\n", body)
+        body = body.rstrip("\n") + (
+            f"\n\n<!-- shipyard:revision-requested -->\n### Your note ({today()})\n\n"
+            f"{text.strip()}\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        self._commit([rel], f"docs(shipyard): {key} sent back with notes")
+        return {"ok": True,
+                "message": f"Sent back. The agent picks your note up on its next run and redrafts "
+                           f"{title} — nothing for you to rewrite."}
+
+    def _readfile(self, path):
+        if not os.path.isfile(path):
+            raise ActionError(f"{path} does not exist")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def criteria_accept(self, identity, epic):
+        e = self._epic(epic)
+        c = self.state._criteria(e)
+        if not c or c["state"] != "review":
+            raise ActionError(f"{epic} has no drafted criteria waiting on you")
+        path = os.path.join(self.root, ".shipyard", c["spec"])
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        text = text.replace("<!-- shipyard:criteria-review -->\n", "").replace(
+            "<!-- shipyard:criteria-review -->", "")
+        text += f"\n<!-- criteria accepted by {identity.describe()} on {today()} -->\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self._commit([os.path.join(".shipyard", c["spec"])], f"spec({epic}): criteria accepted")
+        return {"ok": True, "message": f"Accepted. {epic} can start building."}
+
+    def criteria_revise(self, identity, epic, text):
+        if not text.strip():
+            raise ActionError("say what should be different — that is what the architect redrafts from")
+        e = self._epic(epic)
+        c = self.state._criteria(e)
+        if not c:
+            raise ActionError(f"{epic} has no criteria to revise")
+        path = os.path.join(self.root, ".shipyard", c["spec"])
+        with open(path, encoding="utf-8") as f:
+            body = f.read()
+        body = body.replace("<!-- shipyard:criteria-review -->", "<!-- shipyard:needs-criteria -->")
+        body += f"\n### Your note on the criteria ({today()})\n{text.strip()}\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        self._commit([os.path.join(".shipyard", c["spec"])], f"spec({epic}): criteria sent back")
+        return {"ok": True, "message": f"Sent back. The architect redrafts {epic}'s criteria from your note."}
+
+    def change_file(self, identity, text, epic=None):
+        text = text.strip()
+        if not text:
+            raise ActionError("a change request needs a description")
+        existing = self.state.changes()
+        n = max([int(c["id"][1:]) for c in existing], default=0) + 1
+        title = " ".join(text.split())[:70]
+        scope = epic if epic else "(PM triages on its next run)"
+        block = (f"## C{n} — {title}\nFiled: {today()}\nRequest: {text}\n"
+                 f"Touches: {scope}\nDisposition: pending\n")
+        p = self._append(".shipyard/changes.md", block)
+        self._commit([os.path.relpath(p, self.root)], f"change(C{n}): filed")
+        where = f" against {epic}" if epic else ""
+        return {"ok": True, "message": f"Filed as C{n}{where}. The PM triages it on its next run."}
+
+    def inbox_answer(self, identity, qid, text):
+        text = text.strip()
+        if not text:
+            raise ActionError("an answer needs some words")
+        p = os.path.join(self.root, ".shipyard", "inbox.md")
+        if not os.path.isfile(p):
+            raise ActionError("no inbox.md")
+        with open(p, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        out, hit = [], False
+        for line in lines:
+            m = re.match(rf"^- \[ \] {re.escape(qid)}\b", line)
+            if m:
+                out.append(line.replace("- [ ]", "- [x]", 1))
+                out.append(f"  → {text}")
+                hit = True
+            else:
+                out.append(line)
+        if not hit:
+            raise ActionError(f"{qid} is not an open question")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(out).rstrip("\n") + "\n")
+        self._commit([".shipyard/inbox.md"], f"inbox({qid}): answered")
+        return {"ok": True, "message": f"Answered {qid}. The agent picks it up on its next run."}
+
+    def design_accept(self, identity, epic):
+        e = self._epic(epic)
+        if e["status"] != "Design review":
+            raise ActionError(f"{epic} is not in Design review")
+        spec = e["tasks"][0]["spec"] if e["tasks"] else None
+        if spec:
+            p = self._append(
+                os.path.join(".shipyard", spec),
+                f"\n### Design accepted {today()}\nAccepted by {identity.describe()}. "
+                f"The mockup at {e['preview'] or '(preview URL not recorded)'} is now part of this "
+                f"spec; the fidelity lens reviews the implementation against it.\n",
+            )
+            self._commit([os.path.relpath(p, self.root)], f"design({epic}): accepted")
+        self._board("move", epic, "In progress")
+        return {"ok": True, "message": f"Design accepted. {epic} moved to In progress."}
+
+    def design_annotate(self, identity, epic, text):
+        if not text.strip():
+            raise ActionError("annotations need some words")
+        self._board("annotate", epic, f"design annotation: {' '.join(text.split())}")
+        return {"ok": True, "message": "Sent to the Designer, verbatim. The next revision lands on the same preview URL."}
+
+    def epic_pause(self, identity, epic, reason="change:manual"):
+        self._board("pause", epic, "--reason", reason)
+        return {"ok": True, "message": f"{epic} paused."}
+
+    def epic_resume(self, identity, epic):
+        self._board("resume", epic)
+        return {"ok": True, "message": f"{epic} resumed."}
+
+    def epic_reject(self, identity, epic, notes):
+        if not notes.strip():
+            raise ActionError("send-back needs notes — they become the new acceptance criteria")
+        e = self._epic(epic)
+        spec = e["tasks"][0]["spec"] if e["tasks"] else None
+        if spec:
+            p = self._append(
+                os.path.join(".shipyard", spec),
+                f"\n### Sent back {today()}\n{notes.strip()}\n",
+            )
+            self._commit([os.path.relpath(p, self.root)], f"spec({epic}): sent back with notes")
+        self._board("move", epic, "In progress")
+        return {"ok": True, "message": f"{epic} sent back. Your notes are new acceptance criteria in its spec."}
+
+    def epic_accept_plan(self, identity, epic):
+        """What Accept WOULD do — checked fresh, every time the drawer opens."""
+        e = self._epic(epic)
+        main = self.state.project()["main"]
+        commits = sh(["git", "log", "--oneline", f"{main}..{e['branch']}"], cwd=self.root).stdout.strip()
+        stat = sh(["git", "diff", "--shortstat", f"{main}...{e['branch']}"], cwd=self.root).stdout.strip()
+        others = [x for x in self.state.epics()
+                  if x["id"] != epic and x["branch_exists"] and x["status"] not in ("Done",)]
+        return {
+            "epic": epic,
+            "title": e["title"],
+            "merges": f"{e['branch']} → {main}",
+            "commits": [c for c in commits.splitlines() if c],
+            "diffstat": stat or "no changes",
+            "receipt": e["receipt"],
+            "preview": e["preview"],
+            "blockers": e["blockers"],
+            "can_accept": e["can_accept"] and identity.may_accept(),
+            "rebase_after": [x["branch"] for x in others],
+            "host": self.state.project()["host"],
+        }
+
+    def epic_accept(self, identity, epic):
+        if not identity.may_accept():
+            raise ActionError("this identity may not promote to production")
+        e = self._epic(epic)
+        # Status first: blockers are only computed for an epic that is On stage,
+        # so an empty blocker list on a Done epic must never read as "go" — that
+        # would re-merge something the user already accepted.
+        if e["status"] != "On stage":
+            raise ActionError(
+                f"{epic} is {e['status']}, not On stage — only an epic awaiting your Accept can be promoted"
+            )
+        plan = self.epic_accept_plan(identity, epic)
+        if plan["blockers"]:
+            raise ActionError("preconditions failed: " + "; ".join(plan["blockers"]))
+        main = self.state.project()["main"]
+        host = self.state.project()["host"]
+
+        if host == "github":
+            if not which("gh"):
+                raise ActionError(
+                    "This repo is protected on GitHub, so the merge must go through GitHub's API — "
+                    "and `gh` is not installed here. Merge the PR for "
+                    f"{e['branch']} in GitHub, then reopen this page: it re-derives state and will "
+                    "finish the post-merge steps."
+                )
+            r = sh(["gh", "pr", "merge", e["branch"], "--merge", "--repo",
+                    self.state.project()["slug"]], cwd=self.root)
+            if r.returncode != 0:
+                raise ActionError(f"GitHub refused the merge: {(r.stderr or r.stdout).strip()[:400]}")
+        else:
+            cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root).stdout.strip()
+            if sh(["git", "checkout", main], cwd=self.root).returncode != 0:
+                raise ActionError(f"could not check out {main} — commit or stash your work first")
+            m = sh(["git", "merge", "--no-ff", e["branch"], "-m",
+                    f"Accept {epic}: {e['title']}"], cwd=self.root)
+            if m.returncode != 0:
+                sh(["git", "merge", "--abort"], cwd=self.root)
+                sh(["git", "checkout", cur], cwd=self.root)
+                raise ActionError(f"merge conflicted — nothing was merged: {m.stdout.strip()[:300]}")
+
+        self._board("move", epic, "Done")
+        rebased, paused = self._rebase_sync(main, epic)
+        note = ""
+        if host != "github":
+            note = " Local merge — no server-side ring backed this one."
+        if paused:
+            note += f" Paused (conflict): {', '.join(paused)} — see the inbox."
+        return {"ok": True, "message": f"{epic} accepted and merged into {main}.{note}",
+                "rebased": rebased, "paused": paused}
+
+    def _rebase_sync(self, main, accepted):
+        rebased, paused = [], []
+        for e in self.state.epics():
+            if e["id"] == accepted or e["status"] == "Done" or not e["branch_exists"]:
+                continue
+            cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root).stdout.strip()
+            if sh(["git", "checkout", e["branch"]], cwd=self.root).returncode != 0:
+                continue
+            r = sh(["git", "rebase", main], cwd=self.root)
+            if r.returncode != 0:
+                sh(["git", "rebase", "--abort"], cwd=self.root)
+                paused.append(e["id"])
+                try:
+                    self._board("pause", e["id"], "--reason", "conflict")
+                except ActionError:
+                    pass
+                p = self._append(
+                    ".shipyard/inbox.md",
+                    f"- [ ] Q{self._next_q()} ({e['id']}) Rebase onto {main} conflicted after "
+                    f"accepting {accepted}. Resolve it in a session — Shipyard never force-resolves "
+                    f"a conflict. Asked {today()}",
+                    under="## Open",
+                )
+                self._commit([os.path.relpath(p, self.root)], f"inbox: {e['id']} rebase conflict")
+            else:
+                rebased.append(e["id"])
+            sh(["git", "checkout", cur], cwd=self.root)
+        return rebased, paused
+
+    def _next_q(self):
+        inbox = self.state.inbox()
+        nums = [int(q["id"][1:]) for q in inbox["open"] + inbox["answered"]]
+        return max(nums, default=0) + 1
+
+    def _epic(self, epic):
+        for e in self.state.epics():
+            if e["id"] == epic:
+                return e
+        raise ActionError(f"{epic} is not on the board")
+
+
+class ActionError(Exception):
+    pass
+
+
+def today():
+    return sh(["date", "+%Y-%m-%d"]).stdout.strip() or "today"
+
+
+def which(prog):
+    return sh(["sh", "-c", f"command -v {prog}"]).returncode == 0
+
+
+# --------------------------------------------------------------------------
+# HTTP — the only layer that knows about requests.
+# --------------------------------------------------------------------------
+
+ACTIONS = {
+    "change.file":      lambda a, i, p: a.change_file(i, p.get("text", ""), p.get("epic") or None),
+    "epic.add":         lambda a, i, p: a.epic_add(i, p.get("title", ""), p.get("status") or "In consideration"),
+    "task.add":         lambda a, i, p: a.task_add(i, p.get("epic", ""), p.get("title", "")),
+    "artifact.read":    lambda a, i, p: a.state.artifact(p.get("key", "")),
+    "artifact.approve": lambda a, i, p: a.artifact_approve(i, p.get("key", "")),
+    "artifact.note":    lambda a, i, p: a.artifact_note(i, p.get("key", ""), p.get("text", "")),
+    "criteria.accept":  lambda a, i, p: a.criteria_accept(i, p.get("epic", "")),
+    "criteria.revise":  lambda a, i, p: a.criteria_revise(i, p.get("epic", ""), p.get("text", "")),
+    "inbox.answer":     lambda a, i, p: a.inbox_answer(i, p.get("id", ""), p.get("text", "")),
+    "design.accept":    lambda a, i, p: a.design_accept(i, p.get("epic", "")),
+    "design.annotate":  lambda a, i, p: a.design_annotate(i, p.get("epic", ""), p.get("text", "")),
+    "epic.pause":       lambda a, i, p: a.epic_pause(i, p.get("epic", "")),
+    "epic.resume":      lambda a, i, p: a.epic_resume(i, p.get("epic", "")),
+    "epic.reject":      lambda a, i, p: a.epic_reject(i, p.get("epic", ""), p.get("text", "")),
+    "epic.acceptPlan":  lambda a, i, p: a.epic_accept_plan(i, p.get("epic", "")),
+    "epic.accept":      lambda a, i, p: a.epic_accept(i, p.get("epic", "")),
+}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "shipyard-dashboard"
+    root = "."
+    token = ""
+    identity = Identity()
+    origins = set()
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("  %s\n" % (fmt % args))
+
+    # ---- helpers ----
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # No third-party anything: the page is self-contained by design.
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj))
+
+    def _same_origin(self):
+        """CSRF defence #1: a cross-site POST carries a foreign Origin."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True  # curl/scripts: the token below is the real gate
+        return origin.rstrip("/") in self.origins
+
+    # ---- routes ----
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        state = State(self.root)
+
+        if path == "/api/state":
+            try:
+                return self._json(200, state.snapshot(self.identity))
+            except Exception as e:  # noqa: BLE001 — surface, never blank-screen
+                return self._json(500, {"error": str(e)})
+
+        if path in ("/", "/index.html"):
+            with open(os.path.join(ASSETS, "index.html"), encoding="utf-8") as f:
+                page = f.read()
+            page = page.replace("__SHIPYARD_TOKEN__", html.escape(self.token))
+            return self._send(200, page, "text/html; charset=utf-8")
+
+        safe = os.path.normpath(path).lstrip("/")
+        candidate = os.path.join(ASSETS, safe)
+        if os.path.isfile(candidate) and candidate.startswith(ASSETS):
+            ctype = ("text/css; charset=utf-8" if safe.endswith(".css")
+                     else "application/javascript; charset=utf-8" if safe.endswith(".js")
+                     else "application/octet-stream")
+            with open(candidate, "rb") as f:
+                return self._send(200, f.read(), ctype)
+
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if urllib.parse.urlparse(self.path).path != "/api/action":
+            return self._json(404, {"error": "not found"})
+
+        # CSRF defence #2: only this server's own page carries the token.
+        if self.headers.get("X-Shipyard-Token", "") != self.token:
+            return self._json(403, {"error": "bad or missing token — reload the dashboard"})
+        if not self._same_origin():
+            return self._json(403, {"error": "cross-origin request refused"})
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "malformed request"})
+
+        name = payload.get("action", "")
+        fn = ACTIONS.get(name)
+        if not fn:
+            return self._json(400, {"error": f"unknown action {name!r}"})
+
+        state = State(self.root)
+        actions = Actions(self.root, state)
+        try:
+            return self._json(200, fn(actions, self.identity, payload))
+        except ActionError as e:
+            return self._json(409, {"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            return self._json(500, {"error": f"{type(e).__name__}: {e}"})
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return None
+        d = p
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="Shipyard's local dashboard")
+    ap.add_argument("--port", type=int, default=4173)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--once", action="store_true", help="serve one request and exit (tests)")
+    args = ap.parse_args(argv)
+
+    root = find_root()
+    if not root:
+        print("shipyard-dashboard: no .shipyard/config.yml — run `/shipyard init`", file=sys.stderr)
+        return 3
+    if not os.path.isdir(ASSETS):
+        print(f"shipyard-dashboard: assets missing at {ASSETS}", file=sys.stderr)
+        return 3
+
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        if os.environ.get("SHIPYARD_DASHBOARD_ALLOW_REMOTE") != "1":
+            print(
+                f"shipyard-dashboard: refusing to bind {args.host}.\n"
+                "  This page can merge an epic to production, and it has no login — loopback\n"
+                "  binding IS the access control. To expose it anyway (behind a tunnel you\n"
+                "  trust, on a network you control), set SHIPYARD_DASHBOARD_ALLOW_REMOTE=1.",
+                file=sys.stderr,
+            )
+            return 1
+        print("shipyard-dashboard: WARNING — bound beyond loopback. Anyone who can reach "
+              f"http://{args.host}:{args.port} can merge to production.", file=sys.stderr)
+
+    Handler.root = root
+    Handler.token = secrets.token_urlsafe(32)
+    Handler.identity = Identity()
+    Handler.origins = {f"http://{h}:{args.port}" for h in {args.host, "127.0.0.1", "localhost"}}
+
+    with Server((args.host, args.port), Handler) as httpd:
+        url = f"http://{args.host}:{args.port}"
+        print(f"\n  Shipyard dashboard · {os.path.basename(root)}")
+        print(f"  {url}")
+        print("  local mode · no login (loopback only) · Ctrl-C to stop\n")
+        try:
+            httpd.handle_request() if args.once else httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n  stopped\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

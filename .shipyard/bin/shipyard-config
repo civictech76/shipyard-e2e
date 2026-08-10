@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""shipyard-config — read .shipyard/config.yml (the schema in docs/spec/config.md).
+
+Zero dependencies: parses the config template's YAML subset (two-level maps,
+scalar lists, quoted strings, comments) — not arbitrary YAML. The template is
+the schema; anything it can't parse is a config bug, reported loudly.
+
+Usage:
+  shipyard-config root                  # print repo root (dir containing .shipyard/)
+  shipyard-config get <section.key>     # print a value ("" if empty/absent → exit 1)
+  shipyard-config commands              # non-empty commands, one "name<TAB>cmd" per line
+  shipyard-config statuses              # board statuses in order, one per line
+  shipyard-config list <section.key>    # items of a list value, one per line
+"""
+
+import os
+import sys
+
+
+def find_root(start=None):
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(d, ".shipyard", "config.yml")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def strip_comment(s):
+    """Remove a trailing comment, respecting simple quoting."""
+    out, i, q = [], 0, None
+    while i < len(s):
+        c = s[i]
+        if q:
+            out.append(c)
+            if c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+            out.append(c)
+        elif c == "#":
+            break
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
+def unquote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def parse(path):
+    """Return {section: {key: scalar | [items]}} plus top-level scalars/lists."""
+    data = {}
+    section = None
+    key = None  # current list-collecting key: (section_or_None, key)
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            stripped = strip_comment(line)
+            if not stripped.strip():
+                continue
+            indent = len(stripped) - len(stripped.lstrip())
+            body = stripped.strip()
+            if body.startswith("- "):
+                if key is None and section and data.get(section) == {}:
+                    # top-level `key:` followed directly by items = top-level list
+                    data[section] = []
+                    key = (None, section)
+                if key is None:
+                    die(f"list item outside a key: {line!r}")
+                sec, k = key
+                target = data[sec][k] if sec else data[k]
+                target.append(unquote(body[2:]))
+                continue
+            if ":" not in body:
+                die(f"unparseable line: {line!r}")
+            k, _, v = body.partition(":")
+            k, v = k.strip(), v.strip()
+            if indent == 0:
+                if v == "":
+                    section, key = k, None
+                    data[k] = data.get(k) or {}
+                else:
+                    section = None
+                    if v == "[]":
+                        data[k] = []
+                    else:
+                        data[k] = unquote(v)
+                    key = None
+            else:
+                if section is None:
+                    die(f"indented line outside a section: {line!r}")
+                if v == "":
+                    data[section][k] = []
+                    key = (section, k)
+                else:
+                    if v == "[]":
+                        data[section][k] = []
+                        key = None
+                    else:
+                        data[section][k] = unquote(v)
+                        key = None
+    return data
+
+
+def die(msg, code=2):
+    print(f"shipyard-config: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load():
+    root = find_root()
+    if not root:
+        die("no .shipyard/config.yml found from here upward — run /shipyard init", 3)
+    return root, parse(os.path.join(root, ".shipyard", "config.yml"))
+
+
+def main(argv):
+    if len(argv) < 1:
+        die(__doc__, 2)
+    cmd = argv[0]
+    if cmd == "root":
+        root = find_root()
+        if not root:
+            sys.exit(3)
+        print(root)
+        return
+    root, data = load()
+    if cmd == "get":
+        if len(argv) != 2 or "." not in argv[1]:
+            die("usage: shipyard-config get <section.key>")
+        sec, k = argv[1].split(".", 1)
+        v = data.get(sec, {})
+        v = v.get(k, "") if isinstance(v, dict) else ""
+        if isinstance(v, list):
+            die(f"{argv[1]} is a list — use `list`")
+        print(v)
+        sys.exit(0 if v != "" else 1)
+    elif cmd == "commands":
+        for name in ("typecheck", "test", "lint", "format_check", "build"):
+            v = data.get("commands", {}).get(name, "")
+            if isinstance(v, str) and v:
+                print(f"{name}\t{v}")
+    elif cmd == "statuses":
+        for s in data.get("board", {}).get("statuses", []):
+            print(s)
+    elif cmd == "list":
+        if len(argv) != 2 or "." not in argv[1]:
+            die("usage: shipyard-config list <section.key>")
+        sec, k = argv[1].split(".", 1)
+        v = data.get(sec, {}).get(k, [])
+        if not isinstance(v, list):
+            die(f"{argv[1]} is not a list")
+        for item in v:
+            print(item)
+    else:
+        die(f"unknown subcommand {cmd!r}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
