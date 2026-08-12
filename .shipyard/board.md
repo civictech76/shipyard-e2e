@@ -19,12 +19,12 @@
 ## In progress
 
 <!-- item carries: lane, branch, started-at -->
-### [E1] Greeting · branch epic/greeting · preview: - · status: In progress
-- [ ] [E1.1] print the greeting → specs/greeting.md
 ### [E2] Farewell · branch epic/farewell · preview: - · status: In progress
 - [ ] [E2.1] print the farewell → specs/farewell.md
 
 ## In review
+### [E1] Greeting · branch epic/greeting · preview: - · status: In review
+- [ ] [E1.1] print the greeting → specs/greeting.md
 
 ## On stage
 
