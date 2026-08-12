@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "branch": "mb/e1-harness",
+  "head_sha": "d11286f805686d056c9f18973250be23b2504b83",
+  "base_sha": "1ea3d68212aa8fe8a31c28829a1af71f39c74ebb",
+  "created_at": "2026-08-12T04:32:26Z",
+  "impact": {
+    "files_changed": [
+      ".shipyard/receipts/logs/mb-e1-greeting-test.log",
+      ".shipyard/receipts/mb-e1-greeting.json",
+      "greeting.sh",
+      "tests/greeting.sh"
+    ],
+    "tests_selected": [],
+    "selection": "full-suite"
+  },
+  "runs": [
+    {
+      "name": "test",
+      "cmd": "bash run-tests.sh",
+      "exit": 0,
+      "duration_ms": 38,
+      "log_sha256": "29af76c25dcc37ef2addbd731a66d216db93a2f6ba3ba26e2a448a9e3be29669"
+    }
+  ],
+  "gauntlet": {
+    "reviews_declared": [],
+    "report": "",
+    "confirmed": 0,
+    "fixed": 0
+  },
+  "notes": ""
+}
