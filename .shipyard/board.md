@@ -19,10 +19,10 @@
 ## In progress
 
 <!-- item carries: lane, branch, started-at -->
-### [E2] Farewell · branch epic/farewell · preview: - · status: In progress
+## In review
+### [E2] Farewell · branch epic/farewell · preview: - · status: In review
 - [ ] [E2.1] print the farewell → specs/farewell.md
 
-## In review
 ## On stage
 
 <!-- epic complete, live on its preview URL, awaiting the user's Accept → main -->
