@@ -24,7 +24,7 @@
 
 <!-- epic complete, live on its preview URL, awaiting the user's Accept → main -->
 ### [E1] Greeting · branch epic/greeting · preview: - · status: On stage
-- [ ] [E1.1] print the greeting → specs/greeting.md
+- [x] [E1.1] print the greeting → specs/greeting.md · done: ebd23b9f4f
 ### [E2] Farewell · branch epic/farewell · preview: - · status: On stage
 - [ ] [E2.1] print the farewell → specs/farewell.md
 
