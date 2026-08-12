@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "branch": "chore/test-harness",
+  "head_sha": "88f2435cd0748a678c3a7453e0c66c911485955c",
+  "base_sha": "d6d5d148d2dd6bab36ae26cf86e72a482c25f3c4",
+  "created_at": "2026-08-12T04:31:04Z",
+  "impact": {
+    "files_changed": [
+      "run-tests.sh",
+      "tests/base.sh"
+    ],
+    "tests_selected": [],
+    "selection": "full-suite"
+  },
+  "runs": [
+    {
+      "name": "test",
+      "cmd": "bash run-tests.sh",
+      "exit": 0,
+      "duration_ms": 24,
+      "log_sha256": "af5f512ce652234d893f5e0e2aebe18f3e7148b08d5740d6b483157ffc15b77d"
+    }
+  ],
+  "gauntlet": {
+    "reviews_declared": [],
+    "report": "",
+    "confirmed": 0,
+    "fixed": 0
+  },
+  "notes": ""
+}
