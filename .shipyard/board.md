@@ -26,7 +26,7 @@
 ### [E1] Greeting · branch epic/greeting · preview: - · status: On stage
 - [x] [E1.1] print the greeting → specs/greeting.md · done: ebd23b9f4f
 ### [E2] Farewell · branch epic/farewell · preview: - · status: On stage
-- [ ] [E2.1] print the farewell → specs/farewell.md
+- [x] [E2.1] print the farewell → specs/farewell.md · done: 836169b2d3
 
 ## Done
 
