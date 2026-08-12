@@ -23,12 +23,11 @@
 - [ ] [E2.1] print the farewell → specs/farewell.md
 
 ## In review
-### [E1] Greeting · branch epic/greeting · preview: - · status: In review
-- [ ] [E1.1] print the greeting → specs/greeting.md
-
 ## On stage
 
 <!-- epic complete, live on its preview URL, awaiting the user's Accept → main -->
+### [E1] Greeting · branch epic/greeting · preview: - · status: On stage
+- [ ] [E1.1] print the greeting → specs/greeting.md
 
 ## Done
 
