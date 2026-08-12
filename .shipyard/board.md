@@ -10,6 +10,7 @@
 ## Backlog
 
 ### [E1] Greeting · branch epic/greeting · preview: - · status: Backlog
+- [ ] [E1.1] print the greeting → specs/greeting.md
 
 ### [E2] Farewell · branch epic/farewell · preview: - · status: Backlog
 
