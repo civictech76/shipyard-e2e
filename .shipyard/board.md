@@ -11,6 +11,8 @@
 
 ### [E1] Greeting · branch epic/greeting · preview: - · status: Backlog
 
+### [E2] Farewell · branch epic/farewell · preview: - · status: Backlog
+
 ## Ready for dev
 
 ## Design review
