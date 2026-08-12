@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "branch": "mb/e2-farewell",
+  "head_sha": "646a5a3fa54234121d012f13102d21b5b7a1562c",
+  "base_sha": "1ea3d68212aa8fe8a31c28829a1af71f39c74ebb",
+  "created_at": "2026-08-12T04:33:18Z",
+  "impact": {
+    "files_changed": [
+      "farewell.sh",
+      "tests/farewell.sh"
+    ],
+    "tests_selected": [],
+    "selection": "full-suite"
+  },
+  "runs": [
+    {
+      "name": "test",
+      "cmd": "bash run-tests.sh",
+      "exit": 0,
+      "duration_ms": 20,
+      "log_sha256": "29af76c25dcc37ef2addbd731a66d216db93a2f6ba3ba26e2a448a9e3be29669"
+    }
+  ],
+  "gauntlet": {
+    "reviews_declared": [],
+    "report": "",
+    "confirmed": 0,
+    "fixed": 0
+  },
+  "notes": ""
+}
