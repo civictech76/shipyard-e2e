@@ -13,6 +13,8 @@
 
 ### [E2] Farewell · branch epic/farewell · preview: - · status: Backlog
 
+### [E3] Conversation · branch epic/conversation · preview: - · status: Backlog · depends: E2
+
 ## Ready for dev
 
 ## Design review
