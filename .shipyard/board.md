@@ -16,12 +16,11 @@
 - [ ] [E3.1] greeting then farewell → specs/conversation.md
 
 ## Ready for dev
-### [E1] Greeting · branch epic/greeting · preview: - · status: Ready for dev
-- [ ] [E1.1] print the greeting → specs/greeting.md
-
 ## Design review
 
 <!-- mockup on the epic's preview URL, awaiting the user's design Accept -->
+### [E1] Greeting · branch epic/greeting · preview: - · status: Design review
+- [ ] [E1.1] print the greeting → specs/greeting.md
 
 ## In progress
 
