@@ -19,12 +19,11 @@
 ## Design review
 
 <!-- mockup on the epic's preview URL, awaiting the user's design Accept -->
-### [E1] Greeting · branch epic/greeting · preview: - · status: Design review
-- [ ] [E1.1] print the greeting → specs/greeting.md
-
 ## In progress
 
 <!-- item carries: lane, branch, started-at -->
+### [E1] Greeting · branch epic/greeting · preview: - · status: In progress
+- [ ] [E1.1] print the greeting → specs/greeting.md
 
 ## In review
 
