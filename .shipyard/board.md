@@ -9,13 +9,13 @@
 
 ## Backlog
 
-### [E2] Farewell · branch epic/farewell · preview: - · status: Backlog
-- [ ] [E2.1] print the farewell → specs/farewell.md
-
 ### [E3] Conversation · branch epic/conversation · preview: - · status: Backlog · depends: E2
 - [ ] [E3.1] greeting then farewell → specs/conversation.md
 
 ## Ready for dev
+### [E2] Farewell · branch epic/farewell · preview: - · status: Ready for dev
+- [ ] [E2.1] print the farewell → specs/farewell.md
+
 ## Design review
 
 <!-- mockup on the epic's preview URL, awaiting the user's design Accept -->
