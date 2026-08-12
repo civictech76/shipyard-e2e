@@ -9,6 +9,15 @@
 
 ## Backlog
 
+### [E1] Greeting · branch epic/greeting · preview: - · status: Backlog
+- [ ] [E1.1] print the greeting → specs/greeting.md
+
+### [E2] Farewell · branch epic/farewell · preview: - · status: Backlog
+- [ ] [E2.1] print the farewell → specs/farewell.md
+
+### [E3] Conversation · branch epic/conversation · preview: - · status: Backlog · depends: E2
+- [ ] [E3.1] greeting then farewell → specs/conversation.md
+
 ## Ready for dev
 
 ## Design review

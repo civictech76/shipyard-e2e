@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "branch": "chore/seed-board",
+  "head_sha": "e72a317b23cca4b68af58db25a6cfd9e16ed72f4",
+  "base_sha": "c4a81450c2c3fc951784eb7ecf4dd8e12117ff8a",
+  "created_at": "2026-08-12T04:28:51Z",
+  "impact": {
+    "files_changed": [
+      ".shipyard/board.md",
+      ".shipyard/specs/conversation.md",
+      ".shipyard/specs/farewell.md",
+      ".shipyard/specs/greeting.md"
+    ],
+    "tests_selected": [],
+    "selection": "full-suite"
+  },
+  "runs": [
+    {
+      "name": "test",
+      "cmd": "bash run-tests.sh",
+      "exit": 0,
+      "duration_ms": 10,
+      "log_sha256": "af5f512ce652234d893f5e0e2aebe18f3e7148b08d5740d6b483157ffc15b77d"
+    }
+  ],
+  "gauntlet": {
+    "reviews_declared": [],
+    "report": "",
+    "confirmed": 0,
+    "fixed": 0
+  },
+  "notes": ""
+}
