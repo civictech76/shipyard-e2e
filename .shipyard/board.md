@@ -23,11 +23,10 @@
 ## On stage
 
 <!-- epic complete, live on its preview URL, awaiting the user's Accept → main -->
-### [E2] Farewell · branch epic/farewell · preview: - · status: On stage
-- [x] [E2.1] print the farewell → specs/farewell.md · done: 836169b2d3
-
 ## Done
 
 <!-- user accepted; live in production -->
 ### [E1] Greeting · branch epic/greeting · preview: - · status: Done
 - [x] [E1.1] print the greeting → specs/greeting.md · done: ebd23b9f4f
+### [E2] Farewell · branch epic/farewell · preview: - · status: Done
+- [x] [E2.1] print the farewell → specs/farewell.md · done: 836169b2d3
