@@ -9,8 +9,8 @@
 
 ## Backlog
 
-### [E3] Conversation · branch epic/conversation · preview: - · status: Backlog · depends: E2
-- [ ] [E3.1] greeting then farewell → specs/conversation.md
+### [E4] Test hardening · branch epic/test-hardening · preview: - · status: Backlog
+- [ ] [E4.1] greeting and farewell tests check stderr and exit code → specs/test-hardening.md
 
 ## Ready for dev
 ## Design review
@@ -19,6 +19,11 @@
 ## In progress
 
 <!-- item carries: lane, branch, started-at -->
+### [E3] Conversation · branch epic/conversation · preview: - · status: In progress · depends: E2
+> 2026-09-24 18:03 — design gate skipped: CLI script with no UI, nothing to mock up
+> 2026-09-24 18:03 — approved directly by the user in session 2026-09-24; plan.md is still an unfilled template, so there is no plan approval to cite
+- [ ] [E3.1] greeting then farewell → specs/conversation.md
+
 ## In review
 ## On stage
 
