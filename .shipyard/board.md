@@ -21,6 +21,7 @@
 <!-- item carries: lane, branch, started-at -->
 ## In review
 ### [E3] Conversation · branch epic/conversation · preview: - · status: In review · depends: E2
+> 2026-09-24 18:11 — no preview URL: deploy.adapter is none and this is a CLI script with nothing to host; the proof is shipyard/verify on the epic branch plus bash conversation.sh
 > 2026-09-24 18:03 — design gate skipped: CLI script with no UI, nothing to mock up
 > 2026-09-24 18:03 — approved directly by the user in session 2026-09-24; plan.md is still an unfilled template, so there is no plan approval to cite
 - [x] [E3.1] greeting then farewell → specs/conversation.md · done: 6dbb6c191d
