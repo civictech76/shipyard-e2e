@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "branch": "claude/status-ggt37f",
+  "head_sha": "36bd0e624cadd4e03ee1aa91201f54ffe179faaa",
+  "base_sha": "3e829e4c7d9fa267d2c9c2f17fd57d6e1e794942",
+  "created_at": "2026-09-24T17:55:25Z",
+  "impact": {
+    "files_changed": [
+      ".gitignore",
+      ".shipyard/board.md"
+    ],
+    "tests_selected": [],
+    "selection": "full-suite"
+  },
+  "runs": [
+    {
+      "name": "test",
+      "cmd": "bash run-tests.sh",
+      "exit": 0,
+      "duration_ms": 17,
+      "log_sha256": "f95cd016ef24829cfca61625b968a835e40f22bb84b095b70e7c4be86eecf6b4"
+    }
+  ],
+  "gauntlet": {
+    "reviews_declared": [],
+    "report": "",
+    "confirmed": 0,
+    "fixed": 0
+  },
+  "notes": "Board bookkeeping only: E1/E2 On stage -> Done (shipyard-board move) plus a .gitignore rule for __pycache__. No source, test or config-command file touched, so the code review gauntlet was deliberately skipped; shipyard-board lint and the full test suite are the proof of done."
+}
