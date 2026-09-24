@@ -9,10 +9,10 @@
 
 ## Backlog
 
-### [E3] Conversation · branch epic/conversation · preview: - · status: Backlog · depends: E2
+## Ready for dev
+### [E3] Conversation · branch epic/conversation · preview: - · status: Ready for dev · depends: E2
 - [ ] [E3.1] greeting then farewell → specs/conversation.md
 
-## Ready for dev
 ## Design review
 
 <!-- mockup on the epic's preview URL, awaiting the user's design Accept -->
