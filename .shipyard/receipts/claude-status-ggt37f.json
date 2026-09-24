@@ -1,13 +1,18 @@
 {
   "version": 1,
   "branch": "claude/status-ggt37f",
-  "head_sha": "36bd0e624cadd4e03ee1aa91201f54ffe179faaa",
-  "base_sha": "3e829e4c7d9fa267d2c9c2f17fd57d6e1e794942",
-  "created_at": "2026-09-24T17:55:25Z",
+  "head_sha": "6dbb6c191d3dadfa8fa6d4df569324ff7861e8bb",
+  "base_sha": "4e96d755ac4d3ae3ca074927aef4e331c2688eb7",
+  "created_at": "2026-09-24T18:09:35Z",
   "impact": {
     "files_changed": [
-      ".gitignore",
-      ".shipyard/board.md"
+      ".shipyard/board.md",
+      ".shipyard/reviews/e3.1-conversation-2026-09-24.md",
+      ".shipyard/specs/conversation.md",
+      ".shipyard/specs/test-hardening.md",
+      "conversation.sh",
+      "tests/conversation-reuse.sh",
+      "tests/conversation.sh"
     ],
     "tests_selected": [],
     "selection": "full-suite"
@@ -17,15 +22,21 @@
       "name": "test",
       "cmd": "bash run-tests.sh",
       "exit": 0,
-      "duration_ms": 17,
-      "log_sha256": "f95cd016ef24829cfca61625b968a835e40f22bb84b095b70e7c4be86eecf6b4"
+      "duration_ms": 43,
+      "log_sha256": "74cc00b2759a10cfe7e080e1d865529c71eac43dc4e63424589c5059dd9e6819"
     }
   ],
   "gauntlet": {
-    "reviews_declared": [],
+    "reviews_declared": [
+      "correctness",
+      "security",
+      "simplification",
+      "enterprise-ops",
+      "plan-audit"
+    ],
     "report": "",
-    "confirmed": 0,
-    "fixed": 0
+    "confirmed": 6,
+    "fixed": 6
   },
-  "notes": "Board bookkeeping only: E1/E2 On stage -> Done (shipyard-board move) plus a .gitignore rule for __pycache__. No source, test or config-command file touched, so the code review gauntlet was deliberately skipped; shipyard-board lint and the full test suite are the proof of done."
+  "notes": "E3.1 conversation. Gauntlet: 5 lenses, 15 raw, 11 after dedup, 6 confirmed and fixed, 5 refuted, 0 unverified. Record: .shipyard/reviews/e3.1-conversation-2026-09-24.md. Out-of-scope sibling-test gap filed as E4.1. Design gate skipped: CLI, no UI."
 }
