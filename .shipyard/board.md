@@ -10,6 +10,7 @@
 ## Backlog
 
 ### [E4] Test hardening · branch epic/test-hardening · preview: - · status: Backlog
+- [ ] [E4.1] greeting and farewell tests check stderr and exit code → specs/test-hardening.md
 
 ## Ready for dev
 ## Design review
