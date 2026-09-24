@@ -11,6 +11,7 @@
 
 ## Ready for dev
 ### [E3] Conversation · branch epic/conversation · preview: - · status: Ready for dev · depends: E2
+> 2026-09-24 18:03 — design gate skipped: CLI script with no UI, nothing to mock up
 > 2026-09-24 18:03 — approved directly by the user in session 2026-09-24; plan.md is still an unfilled template, so there is no plan approval to cite
 - [ ] [E3.1] greeting then farewell → specs/conversation.md
 
